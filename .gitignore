@@ -1,0 +1,26 @@
+# RStudio temporary files
+.Rproj.user/
+.Rhistory
+.RData
+.Ruserdata
+
+# R Markdown temporary files
+*_cache/
+*_files/
+*.utf8.md
+*.knit.md
+
+# Temporary and backup files
+*.Rproj.user
+*~
+*.bak
+*.tmp
+
+# Development and intermediate material
+Analysis/Temp/
+Original_Data/
+Previous_Analysis/
+
+# Operating system files
+Thumbs.db
+.DS_Store

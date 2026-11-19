@@ -1,0 +1,3714 @@
+---
+title: "Greek rivers: model evaluation, phosphorus boundaries and uncertainty"
+subtitle: "Selected logistic models for R-M2 and R-M4 river types | Notebook 04"
+output:
+  html_notebook:
+    toc: true 
+    toc_depth: 3
+    code_folding: hide
+---
+
+## Purpose and scope
+
+This notebook evaluates selected binary logistic regression models for two Greek river types: lowland (R-M2) and upland/mountain (R-M4) rivers. The response, `BinClass_HESY`, indicates whether the site-averaged HESY2 zoobenthos index is classified as Good or better (`1`) or Not Good (`0`). The models relate that response to phosphate (P–PO4) and, where selected, conductivity, Habitat Modification Score (HMS) and dissolved oxygen (DO).
+
+Model selection took place in **`03_Model_Selection.Rmd`**. This notebook refits the selected univariate and multivariate structures using the type-specific complete-case datasets and then addresses three linked questions:
+
+1. **Predictive performance:** How well do the selected models classify ecological status, both on the fitted observations and when entire Water Districts are excluded from fitting?
+2. **Conditional boundary prediction:** What phosphate concentrations correspond to a selected probability of Good status at specified values of the other environmental variables?
+3. **Uncertainty and sensitivity:** How uncertain are the boundaries under site-level bootstrap resampling, how do they change with probability-threshold choice, and how does uncertainty vary across environmental gradients?
+
+The notebook produces the model coefficient and validation tables, the manuscript boundary tables, Figures 4–7 and supplementary Figures S3–S5. The R-M2 conductivity–agricultural land-use analysis provides supporting ecological context rather than another boundary-setting model.
+
+### Relationship to the preceding notebooks
+
+The analysis uses the prepared site-averaged dataset supplied in `Data/Processed/`. Predictor screening and all-subsets model comparison are documented in Notebooks 02 and 03, respectively; **the models are not reselected here**. The primary output directories are `Outputs/Tables` for Word tables and `Outputs/Figures` for PNG figures. Code blocks are folded by default in the HTML notebook to make the explanations easier to follow.
+
+### Reproducibility and interpretation
+
+Run the sections in order, preferably from a clean R session. The notebook requires the processed CSV under `Data/Processed`, the custom helper scripts under `Functions`, and the R packages loaded below. The probability thresholds used in the boundary tables are extracted dynamically from the `OmisComm` rows of `threshold_summary_RM2` and `threshold_summary_RM4` (Section 4.2). The chosen selection rule is fixed, but the numerical thresholds update when the models or input data change. The bootstrap procedures use 1,000 site-level resamples with a fixed random seed for repeatability.
+
+Bootstrap intervals quantify sampling uncertainty **conditional on the selected model structure and probability threshold**. They do not incorporate uncertainty from model selection or from selecting the probability threshold. The extended HMS range used for Figure S5 is a sensitivity illustration and may extrapolate beyond well-represented site conditions.
+
+```{r}
+# ---- Required packages ----
+# dplyr     : Data manipulation and filtering
+# tidyr     : Reshaping data and creating prediction grids
+# ggplot2   : Data visualisation
+# readr     : Reading and writing CSV files
+# here      : Project-relative file paths
+# purrr     : Iteration over models and boundary scenarios
+# stringr   : Character string manipulation
+# tibble    : Creating data frames
+# forcats   : Factor manipulation
+# modEvA    : Model evaluation and classification statistics
+# pROC      : ROC curves and AUC calculations
+# gridExtra : Combining multiple plots
+# grid      : Graphical layout and grobs
+# ggnewscale: Multiple colour scales in ggplot2
+# flextable : Formatting and exporting Word tables
+# broom     : Extracting model coefficients and statistics
+# officer   : Word document formatting
+# patchwork : Combining plots for Figure S5
+# mgcv      : Generalised additive modelling for Figure 7
+# scales    : Formatting axis labels
+
+required_packages <- c(
+  "dplyr",
+  "tidyr",
+  "ggplot2",
+  "readr",
+  "here",
+  "purrr",
+  "stringr",
+  "tibble",
+  "forcats",
+  "modEvA",
+  "pROC",
+  "gridExtra",
+  "grid",
+  "ggnewscale",
+  "flextable",
+  "broom",
+  "officer",
+  "patchwork",
+  "mgcv",
+  "scales"
+)
+
+# ---- Load packages used without :: ----
+
+library(dplyr)
+library(tidyr)
+library(here)
+library(ggplot2)
+library(purrr)
+library(stringr)
+library(flextable)
+library(broom)
+library(modEvA)
+library(patchwork)
+library(mgcv)
+library(ggnewscale)
+library(officer)
+
+# Other packages are accessed using package::function()
+```
+
+
+
+## 1. Input data and selected model fitting
+
+### 1.1 Load processed site means and define analysis datasets
+
+The input contains five candidate environmental predictors: log10 phosphate (`L10P_PO4`), log10 nitrate (`L10N_NO3`), log10 conductivity (`L10Cond`), DO and HMS. The logarithmic variables were constructed following site averaging. Only the selected predictors are required to be complete for fitting each river-type model; this is deliberately less restrictive than the five-predictor complete-case subset used for model selection.
+
+For R-M2, the selected multivariate predictors are phosphate, conductivity and HMS; for R-M4, the optimal model uses phosphate and HMS and the additional model also uses DO. The original site and Water District identifiers are retained for later spatial cross-validation.
+
+```{r getdata, message=FALSE, warning=FALSE}
+
+input_file <- here::here("Data", "Processed", "Greek_RM2_RM4_SiteMeans.csv")
+stopifnot(file.exists(input_file))
+
+predictors <- c("L10P_PO4", "L10N_NO3", "L10Cond", "DO", "HMS")
+model_vars <- c("BinClass_HESY", predictors)
+required_vars <- c("ICType", "HESY2", model_vars)
+
+dat <- readr::read_csv(input_file, show_col_types = FALSE)
+missing_vars <- setdiff(required_vars, names(dat))
+if (length(missing_vars)) {
+  stop("Missing required columns: ", paste(missing_vars, collapse = ", "))
+}
+
+# Variables required for each river type
+CompleteList_RM2 <- c(
+  "BinClass_HESY", "L10Cond", "L10P_PO4", "HMS"
+)
+
+CompleteList_RM4 <- c(
+  "BinClass_HESY", "L10P_PO4", "DO", "HMS"
+)
+
+# Function to prepare model datasets
+make_model_data <- function(x, river_type, variables) {
+  x %>%
+    filter(
+      ICType == river_type,
+      !is.na(HESY2)
+    ) %>%
+    filter(if_all(all_of(variables), is.finite)) %>%
+    droplevels() %>%
+    as.data.frame()
+}
+
+# Create datasets using the appropriate variables
+dat_RM2 <- make_model_data(dat, "R-M2", CompleteList_RM2)
+dat_RM4 <- make_model_data(dat, "R-M4", CompleteList_RM4)
+
+# Confirm binary response and presence of both outcome classes
+for (x in list(dat_RM2, dat_RM4)) {
+  stopifnot(all(x$BinClass_HESY %in% c(0, 1)))
+  stopifnot(length(unique(x$BinClass_HESY)) == 2L)
+}
+```
+
+### 1.2 Load custom evaluation and boundary functions
+
+The helper scripts must be placed in the repository's `Functions/` directory so that the notebook does not depend on an specific Windows drive. They supply threshold-dependent classification measures and numerical solutions for conditional boundary concentrations. If the files are absent, the chunk stops with an explicit list of missing scripts.
+
+```{r load_custom_functions}
+# These helper functions must be supplied in the repository's Functions/ folder.
+fd <- here::here("Functions")
+helper_files <- c(
+  "GetAllMeasures.R", "getAUCandPrev.R", "getThresholdTable.R",
+  "create_pred_matrixV2.R", "solve_predictor_given_p.R",
+  "format_results_wide.R"
+)
+missing_helpers <- helper_files[!file.exists(file.path(fd, helper_files))]
+if (length(missing_helpers)) {
+  stop(
+    "Missing custom R scripts in ", fd, ": ",
+    paste(missing_helpers, collapse = ", "),
+    ". Copy the required helper scripts into Functions/ before running."
+  )
+}
+for (script in helper_files) {
+  source(file.path(fd, script))
+}
+```
+
+### 1.3 Fit the selected logistic models
+
+Five models are fitted: a phosphate-only and a multivariate model for each river type, plus an additional R-M4 multivariate model including DO. All use additive logistic regression (`binomial(link = "logit")`); no interaction terms are fitted. Coefficients and sample sizes are extracted for reporting. These are the fitted models used throughout the remainder of the notebook.
+
+```{r fit_selected_models}
+# Fit the models selected in Notebook 03
+mod_u_RM2 <- glm(BinClass_HESY ~ L10P_PO4 + L10Cond  + HMS,
+           data = dat_RM2,
+           family = binomial(link = "logit"))
+
+mod_u_RM4 <- glm(BinClass_HESY ~ L10P_PO4 + HMS,
+           data = dat_RM4,
+           family = binomial(link = "logit"))
+
+mod_u2_RM4 <- glm(BinClass_HESY ~ L10P_PO4 + HMS + DO,
+           data = dat_RM4,
+           family = binomial(link = "logit"))
+
+mod_P_RM2 <- glm(BinClass_HESY ~ L10P_PO4,
+           data = dat_RM2,
+           family = binomial(link = "logit"))
+
+mod_P_RM4 <- glm(BinClass_HESY ~ L10P_PO4,
+           data = dat_RM4,
+           family = binomial(link = "logit"))
+
+# Collect fitted models
+models <- list(
+  RM2_optimal = mod_u_RM2,
+  RM4_optimal = mod_u_RM4,
+  RM4_additional = mod_u2_RM4,
+  RM2_P_only = mod_P_RM2,
+  RM4_P_only = mod_P_RM4
+)
+
+# Extract model coefficients and sample sizes
+model_coefficients <- bind_rows(
+  lapply(names(models), function(nm) {
+
+    mod <- models[[nm]]
+
+    tidy(mod) %>%
+      mutate(
+        Model = nm,
+        N = nobs(mod),
+        .before = 1
+      )
+  })
+)
+```
+
+### 1.4 Check multicollinearity
+
+Variance inflation factors (VIF) were calculated for the selected
+multivariate models. Values below 5 were considered acceptable.
+
+```{r vif-check}
+# Select multivariate models only
+vif_models <- models[c(
+  "RM2_optimal",
+  "RM4_optimal",
+  "RM4_additional"
+)]
+
+vif_results <- dplyr::bind_rows(
+  lapply(names(vif_models), function(nm) {
+
+    vif <- car::vif(vif_models[[nm]])
+
+    data.frame(
+      Model = nm,
+      Predictor = names(vif),
+      VIF = as.numeric(vif)
+    )
+  })
+)
+
+print(vif_results)
+
+# Check against threshold
+if (any(vif_results$VIF >= 5)) {
+  warning("One or more VIF values are >= 5.")
+}
+```
+
+## 2. Model coefficients and predictive performance
+
+### 2.1 Selected model coefficients — Table 2
+
+Table 2 reports coefficient estimates, standard errors and p-values from the fitted models. It is presented before validation so the model definitions can be inspected independently of their performance statistics. The table is exported as a Word document.
+
+```{r model_coefficients_table}
+# Prepare table
+tab <- model_coefficients %>%
+  mutate(
+    Model = dplyr::recode(
+      Model,
+      "RM2_P_only" = "R-M2 univariate",
+      "RM2_optimal" = "R-M2 optimal",
+      "RM4_P_only" = "R-M4 univariate",
+      "RM4_optimal" = "R-M4 optimal",
+      "RM4_additional" = "R-M4 additional"
+    ),
+    Model = factor(
+      Model,
+      levels = c(
+        "R-M2 univariate",
+        "R-M2 optimal",
+        "R-M4 univariate",
+        "R-M4 optimal",
+        "R-M4 additional"
+      )
+    )
+  ) %>%
+  arrange(Model) %>%
+  mutate(
+    # Include N in model heading
+    Model = paste0(as.character(Model), " (N = ", N, ")"),
+
+    across(
+      c(estimate, std.error),
+      ~ round(.x, 3)
+    ),
+
+    p.value = ifelse(
+      p.value < 0.001,
+      "<0.001",
+      sprintf("%.3f", p.value)
+    )
+  ) %>%
+  select(
+    Model,
+    Predictor = term,
+    Coefficient = estimate,
+    SE = std.error,
+    p = p.value
+  )
+
+# Convert to grouped data
+tab_grouped <- as_grouped_data(
+  tab,
+  groups = "Model"
+)
+
+# Identify model heading rows for formatting
+model_heading_rows <- which(is.na(tab_grouped$Predictor))[-1]
+
+# Identify rows immediately before each heading
+model_end_rows <- model_heading_rows - 1
+
+# Create flextable
+ft <- as_flextable(tab_grouped) %>%
+  theme_booktabs() %>%
+  hline(
+    i = model_end_rows,
+    border = officer::fp_border(color = "grey70", width = 0.5),
+    part = "body"
+  ) %>%
+  autofit() %>%
+  set_caption(
+    caption = "Table 2 Logistic regression coefficients for the selected models"
+  )
+# Create output directory
+output_dir <- here::here("Outputs", "Tables")
+
+dir.create(
+  output_dir,
+  recursive = TRUE,
+  showWarnings = FALSE
+)
+
+# Save as Word document
+save_as_docx(
+  ft,
+  path = file.path(output_dir, "Table2.docx")
+)
+
+# Display table
+ft
+```
+
+### 2.2 Leave-one-Water-District-out cross-validation
+
+**Purpose.** Apparent discrimination can overstate performance when a model is evaluated on observations used for fitting. Spatially blocked cross-validation assesses transferability to geographical areas withheld from the fit. For each Water District, models are refitted to all other districts and used to predict the excluded district; the held-out predictions are then pooled.
+
+Water Districts are identified using their leading two-digit codes to avoid differences in Greek district names. Observations lacking a district identifier remain eligible for the principal model fit but are **excluded from spatial cross-validation**. The district summary below documents the distribution of Good and Not Good cases in the validation dataset.
+
+#### 2.2.1 Standardise district identifiers
+
+```{r district_identifiers}
+
+dat_RM2 <- dat_RM2 %>%
+  mutate(
+    District = stringr::str_extract(
+      stringr::str_trim(Water.District), "^[0-9]{2}"
+    )
+  )
+
+dat_RM4 <- dat_RM4 %>%
+  mutate(
+    District = stringr::str_extract(
+      stringr::str_trim(Water.District), "^[0-9]{2}"
+    )
+  )
+
+```
+
+#### 2.2.2 Summarise geographical coverage
+
+```{r district_distribution}
+
+
+district_summary <- bind_rows(
+  dat_RM2 %>% mutate(River_Type = "R-M2"),
+  dat_RM4 %>% mutate(River_Type = "R-M4")
+) %>%
+  filter(!is.na(District)) %>%
+  group_by(River_Type, District) %>%
+  summarise(
+    N = n(),
+    Good = sum(BinClass_HESY == 1),
+    NotGood = sum(BinClass_HESY == 0),
+    .groups = "drop"
+  ) %>%
+  arrange(River_Type, District)
+
+knitr::kable(
+  district_summary,
+  caption = "Distribution of observations used for spatial validation"
+)
+
+```
+
+#### 2.2.3 Define and run spatial cross-validation
+
+```{r define_spatial_cv}
+
+
+spatial_cv <- function(data, model) {
+
+  # Exclude observations without Water District information
+  data <- data %>%
+    filter(!is.na(District))
+
+  model_formula <- formula(model)
+
+  districts <- unique(data$District)
+
+  predictions <- lapply(districts, function(d) {
+
+    # Training and validation observations
+    train <- data %>% filter(District != d)
+    test  <- data %>% filter(District == d)
+
+    # Refit model excluding the validation district
+    mod <- glm(
+      model_formula,
+      data = train,
+      family = binomial(link = "logit")
+    )
+
+    # Predict withheld observations
+    test %>%
+      mutate(
+        Predicted = as.numeric(
+          predict(mod, newdata = test, type = "response")
+        ),
+      )
+  })
+
+  bind_rows(predictions)
+}
+
+```
+
+```{r run_spatial_cv}
+
+
+models_cv <- list(
+  "R-M2 univariate" = list(dat = dat_RM2, mod = mod_P_RM2),
+  "R-M2 optimal"    = list(dat = dat_RM2, mod = mod_u_RM2),
+  "R-M4 univariate" = list(dat = dat_RM4, mod = mod_P_RM4),
+  "R-M4 optimal"    = list(dat = dat_RM4, mod = mod_u_RM4),
+  "R-M4 additional" = list(dat = dat_RM4, mod = mod_u2_RM4)
+)
+
+cv_results <- lapply(models_cv, function(x) {
+  spatial_cv(
+    data = x$dat,
+    model = x$mod
+  )
+})
+
+```
+
+
+### 2.3 Discrimination and calibration metrics — Table 3
+
+Table 3 compares model performance before and after spatial cross-validation. **Apparent AUC** measures discrimination using predictions from models fitted to the data, whereas **spatial AUC** measures discrimination using predictions for Water Districts excluded from model fitting. For a consistent comparison, apparent AUC is recalculated using only those observations included in spatial cross-validation. The two AUC values therefore differ in how the predictions were obtained, rather than in which observations were evaluated.
+
+The **Brier score** measures the average squared difference between predicted probabilities and observed classifications, with lower values indicating better predictions. **Brier skill** expresses the improvement relative to a model that predicts the same probability for every observation, based on the overall prevalence of Good status.
+
+The difference between spatial and apparent AUC is also reported. Negative values indicate a reduction in discriminatory performance following spatial cross-validation.
+
+```{r spatial_performance_metrics}
+
+
+calculate_auc <- function(observed, predicted) {
+
+  as.numeric(
+    pROC::auc(
+      pROC::roc(
+        response = observed,
+        predictor = predicted,
+        levels = c(0, 1),
+        direction = "<",
+        quiet = TRUE
+      )
+    )
+  )
+}
+
+# ------------------------------------------------------------
+# Calculate spatial validation statistics
+# ------------------------------------------------------------
+
+spatial_results <- bind_rows(
+  lapply(names(models_cv), function(model_name) {
+
+    cv <- cv_results[[model_name]]
+
+    # Refit using observations included in spatial validation
+    mod_apparent <- glm(
+      formula(models_cv[[model_name]]$mod),
+      data = cv,
+      family = binomial(link = "logit")
+    )
+
+    apparent_predictions <- predict(
+      mod_apparent,
+      newdata = cv,
+      type = "response"
+    )
+
+    tibble(
+      Model = model_name,
+
+      N = nrow(cv),
+
+      N_districts = n_distinct(cv$District),
+
+      Apparent_AUC = calculate_auc(
+        cv$BinClass_HESY,
+        apparent_predictions
+      ),
+
+      Spatial_AUC = calculate_auc(
+        cv$BinClass_HESY,
+        cv$Predicted
+      ),
+
+      Brier = mean(
+        (cv$BinClass_HESY - cv$Predicted)^2
+      ),
+
+      Prevalence = mean(cv$BinClass_HESY),
+
+      Baseline_Brier = Prevalence * (1 - Prevalence)
+    )
+  })
+) %>%
+  mutate(
+    AUC_difference = Spatial_AUC - Apparent_AUC,
+
+    Brier_Skill = 1 - Brier / Baseline_Brier
+  )
+
+spatial_results
+```
+
+```{r model_validation_table}
+
+# Prepare table directly from spatial_results
+tab_validation <- spatial_results %>%
+  mutate(
+    Model = factor(
+      Model,
+      levels = c(
+        "R-M2 univariate",
+        "R-M2 optimal",
+        "R-M4 univariate",
+        "R-M4 optimal",
+        "R-M4 additional"
+      )
+    )
+  ) %>%
+  arrange(Model) %>%
+  select(
+    Model,
+    N,
+    `Apparent AUC` = Apparent_AUC,
+    `Spatial AUC` = Spatial_AUC,
+    `AUC difference` = AUC_difference,
+    `Brier score` = Brier,
+    `Brier skill` = Brier_Skill,
+    Prevalence
+  )
+
+# Identify row separating the two river types
+divider_row <- sum(grepl("^R-M2", as.character(tab_validation$Model)))
+
+# Format for Word
+ft_validation <- flextable(tab_validation) %>%
+  colformat_double(
+    j = 3:8,
+    digits = 3
+  ) %>%
+  theme_booktabs() %>%
+  hline(
+    i = divider_row,
+    border = officer::fp_border(color = "grey70", width = 0.5),
+    part = "body"
+  ) %>%
+  set_caption(
+    caption = paste(
+      "Table 3",
+      "Predictive performance of the selected logistic regression models,",
+      "including apparent and spatially cross-validated AUC,",
+      "Brier score and Brier skill score."
+    )
+  ) %>%
+  autofit()
+
+# Create output directory
+output_dir <- here::here("Outputs", "Tables")
+
+dir.create(
+  output_dir,
+  recursive = TRUE,
+  showWarnings = FALSE
+)
+
+# Save as Word document
+flextable::save_as_docx(
+  ft_validation,
+  path = file.path(output_dir, "Table3_Model_spatial_validation.docx")
+)
+
+# Display table
+ft_validation
+```
+
+## 3. Predicted probabilities across environmental gradients
+
+Figures 4 and 5 illustrate how the predicted probability of Good ecological status varies with the environmental predictors included in the fitted models. Predictions from the univariate phosphate models are included for comparison with the multivariate models. The fitted smooth curves are included to illustrate the general relationships and are not used to calculate phosphorus boundaries
+
+### 3.1 Figure 4 — R-M2 lowland rivers
+
+```{r Figure_4,  fig.width=6.25,fig.height=5}
+# R-M2 lowland: predicted probabilities for each model
+plot_data_RM2 <- dat_RM2 %>%
+  mutate(
+    pred_prob = as.numeric(
+      predict(mod_u_RM2, newdata = dat_RM2, type = "response")
+    ),
+    pred_prob_TP = as.numeric(
+      predict(mod_P_RM2, newdata = dat_RM2, type = "response")
+    )
+  )
+
+# R-M2 # Plot predicted probabilities vs P_PO4
+p1_RM2 <- ggplot(plot_data_RM2, aes(x = 10^(L10P_PO4), y = pred_prob)) +
+  geom_point(alpha = 0.4) +
+  geom_smooth(method = "gam", se = TRUE, color = "blue") +
+  geom_point(aes(x = 10^(L10P_PO4), y = pred_prob_TP),alpha = 0.4,colour="red") +
+  scale_x_log10() +
+  coord_cartesian(ylim = c(-0.1, 1))+
+  labs(
+    x = expression("P–PO"[4]^"3-" ~ "(" * mu * "g P L"^{-1} * ")"),
+    y = "Predicted Probability", subtitle = "a Phosphorus optimal model)",
+       title = "Lowland streams(R-M2)") +
+  theme_classic()
+
+# Plot predicted probabilities vs Conductivity
+p2_RM2 <-ggplot(plot_data_RM2, aes(x = 10^(L10Cond), y = pred_prob)) +
+  geom_point(alpha = 0.4) +
+  scale_x_log10()+
+ coord_cartesian(ylim = c(-0.1, 1))+
+  geom_smooth(method = "gam", se = TRUE, color = "blue") +
+  labs(
+    x = expression("Conductivity (mS cm"^{-1} * ")"),
+    y = "Predicted Probability", subtitle = "b Conductivity optimal model)",
+       title = " ") +
+  theme_classic()
+
+# Plot predicted probabilities vs HMS
+p3_RM2 <-ggplot(plot_data_RM2, aes(x = HMS, y = pred_prob)) +
+  geom_point(alpha = 0.4) +
+  coord_cartesian(ylim = c(-0.1, 1))+
+  geom_smooth(method = "gam", se = TRUE, color = "blue") +
+  labs(
+    x = "HMS",
+    y = "Predicted Probability",subtitle = "c) HMS optinmal model",title ="") +
+  theme_classic()
+
+# Combine plots into a single figure
+fig_RM2 <- gridExtra::arrangeGrob(
+  p1_RM2, p2_RM2, p3_RM2,
+  ncol = 2, nrow = 2
+)
+
+# Display figure
+grid::grid.newpage()
+grid::grid.draw(fig_RM2)
+
+# Save Figure 4
+output_file <- here::here(
+  "Outputs", "Figures", "Figure_4_RM2_Predicted_Probabilities.png"
+)
+
+dir.create(
+  dirname(output_file),
+  recursive = TRUE,
+  showWarnings = FALSE
+)
+
+ggplot2::ggsave(
+  filename = output_file,
+  plot = fig_RM2,
+  width = 8,
+  height = 8,
+  dpi = 300,
+  units = "in"
+)
+```
+
+### 3.2 Figure 5 — R-M4 upland rivers
+
+The R-M4 displays include both the optimal model (phosphate and HMS) and the additional model (phosphate, HMS and DO).
+
+```{r Figure_5,  fig.width=6.25,fig.height=7.5}
+# R-M4: predicted probabilities for each model
+
+plot_data_RM4 <- dat_RM4 %>%
+  mutate(
+    pred_prob = as.numeric(
+      predict(mod_u_RM4, newdata = dat_RM4, type = "response")
+    ),
+
+    pred_prob_full = as.numeric(
+      predict(mod_u2_RM4, newdata = dat_RM4, type = "response")
+    ),
+
+    pred_prob_TP = as.numeric(
+      predict(mod_P_RM4, newdata = dat_RM4, type = "response")
+    )
+  )
+
+# Plot predicted probabilities vs P_PO4
+p1_RM4 <- ggplot(plot_data_RM4, aes(x = 10^(L10P_PO4), y = pred_prob)) +
+  geom_point(alpha = 0.4) +
+  geom_smooth(method = "gam", se = TRUE, color = "blue") +
+  geom_point(aes(x = 10^(L10P_PO4), y = pred_prob_TP),alpha = 0.4,colour="red") +
+  scale_x_log10() +
+  coord_cartesian(ylim = c(-0.1, 1))+
+  labs(
+    x = expression("P–PO"[4]^"3-" ~ "(" * mu * "g P L"^{-1} * ")"),
+       y = "Predicted Probability", 
+       title = "Upland streams(R-M4)",subtitle = "a) Phosphorus optimal model") +
+  theme_classic()
+
+# Plot predicted probabilities vs HMS
+p2_RM4 <-ggplot(plot_data_RM4, aes(x = HMS, y = pred_prob)) +
+  geom_point(alpha = 0.4) +
+  coord_cartesian(ylim = c(-0.1, 1))+
+  geom_smooth(method = "gam", se = TRUE, color = "blue") +
+  labs(
+    x = "HMS", y = "Predicted Probability", title = "", 
+       subtitle = "b) HMS optimal model" ) +
+  theme_classic()
+
+# Plot predicted probabilities vs P_PO4
+p3_RM4 <- ggplot(plot_data_RM4, aes(x = 10^(L10P_PO4),
+                                    y = pred_prob_full)) +
+  geom_point(alpha = 0.4) +
+  geom_smooth(method = "gam", se = TRUE, color = "blue") +
+  geom_point(aes(x = 10^(L10P_PO4), y = pred_prob_TP),alpha = 0.4,colour="red") +
+  scale_x_log10() +
+  coord_cartesian(ylim = c(-0.1, 1))+
+  labs(
+    x = expression("P–PO"[4]^"3-" ~ "(" * mu * "g P L"^{-1} * ")"),
+    y = "Predicted Probability", 
+       title = "Upland streams(R-M4)",subtitle = "c) Phosphorus additional  model") +
+  theme_classic()
+
+# Plot predicted probabilities vs HMS
+p4_RM4 <-ggplot(plot_data_RM4, aes(x = HMS,
+                                   y = pred_prob_full)) +
+  geom_point(alpha = 0.4) +
+  coord_cartesian(ylim = c(-0.1, 1))+
+  geom_smooth(method = "gam", se = TRUE, color = "blue") +
+  labs(
+    x = "HMS", y = "Predicted Probability", title= "",
+       subtitle = "d) HMS additional  model" ) +
+  theme_classic()
+
+
+# Plot predicted probabilities vs DO
+p5_RM4 <- ggplot(plot_data_RM4, aes(x = DO, y = pred_prob_full)) +
+  geom_point(alpha = 0.4) +
+  coord_cartesian(ylim = c(-0.1, 1))+
+  geom_smooth(method = "gam", se = TRUE, color = "blue") +
+  labs(
+    x = expression("DO (mg L"^{-1} * ")"),
+       y = "Predicted Probability",title= "", 
+       subtitle = "e) DO additional model") +
+ theme_classic()
+
+# Combine plots into a single figure
+fig_RM4 <- gridExtra::arrangeGrob(
+  p1_RM4, p2_RM4, p3_RM4, p4_RM4, p5_RM4,
+  ncol = 2, nrow = 3
+)
+
+# Display figure
+grid::grid.newpage()
+grid::grid.draw(fig_RM4)
+
+# Save figure
+output_file <- here::here(
+  "Outputs", "Figures", "Fig5_RM4_Predicted_Probabilities.png"
+)
+
+dir.create(dirname(output_file), recursive = TRUE, showWarnings = FALSE)
+
+ggsave(
+  filename = output_file,
+  plot = fig_RM4,
+  width = 8,
+  height = 10,
+  dpi = 300,
+  units = "in"
+)
+```
+
+## 4. Probability threshold selection
+
+A fitted logistic model returns a **probability** of Good status, which must be converted to a binary prediction before calculating classification agreement and errors. This section examines how Cohen's kappa, commission and omission vary with the probability cut-off. The two river types are analysed separately because their fitted models use different observations and predictors.
+
+**Commission** and **omission** are defined by the confusion-matrix functions loaded in Section 1.2; the same definitions are used throughout the analysis. This section reports three threshold-selection criteria (`OmisComm`, `MinCom` and `MinOm`).
+
+### 4.1 Classification measures and Figure 6
+
+```{r classification_measures}
+
+
+#create list of models for RM2 type
+models_list <- list(
+  mod_P_RM2 = mod_P_RM2,
+  mod_u_RM2 = mod_u_RM2)
+
+#Call function to calculate confusion matrix and measures for RM2
+Results_RM2 <- getAllMeasures(models_list,df=dat_RM2)
+Results_RM2 <- addOptEachFields(Results_RM2) # adds additional fields 
+# Calculate AUC and prevalence for annotation of Figure 6
+ThreshIndMeas_RM2 <- getAUCandPrev(models_list) # add AUC and Prevalence
+
+
+#create list of models for RM4 type
+models_list <- list(
+  mod_P_RM4 = mod_P_RM4,
+  mod_u_RM4 = mod_u_RM4,
+  mod_u2_RM4 = mod_u2_RM4)
+
+#Call function to calculate confusion matrix and measures for RM4
+Results_RM4 <- getAllMeasures(models_list,df=dat_RM4)
+Results_RM4 <- addOptEachFields(Results_RM4)
+
+# Calculate AUC and prevalence for annotation of Figure 6
+ThreshIndMeas_RM4 <- getAUCandPrev(models_list)
+
+```
+
+```{r Figure_6,  fig.width=6.25,fig.height=5}
+# AUC text to paste
+auc_RM2 <- round(ThreshIndMeas_RM2$AUC,2)
+auc_RM4 <- round(ThreshIndMeas_RM4$AUC,2)
+aucText_RM2 <- paste("AUC multi ",auc_RM2[2]," uni ",auc_RM2[1])
+aucText_RM4 <- paste("AUC multi ",auc_RM4[2]," uni ",auc_RM4[1])
+
+p1_RM2 <- ggplot(Results_RM2$mod_u_RM2$allMeasures, aes(x = p)) +
+  geom_line(aes(y = kappa), linewidth = 1,colour = "blue") +
+  geom_line(data=Results_RM2$mod_P_RM2$allMeasures,aes(y = kappa,x = p), linewidth = 1,colour = "blue",lty=2) +
+  scale_y_continuous(limits = c(0,0.9))+  
+  annotate("text",x=0,y=0.9,label = paste("Prev. = ",round(ThreshIndMeas_RM2$Prevalence[1],2)),size=3.5,hjust=0)+
+  annotate("text",x=0.0,y=0.82,label = aucText_RM2,size=3.5,hjust=0)+
+  labs(x = "Threshold Probability",title = "Lowland streams(R-M2)")+
+  theme_classic()+
+  theme(plot.title = element_text(size = 12, face = "bold"))  
+  
+
+p3_RM2 <- ggplot(Results_RM2$mod_u_RM2$allMeasures, aes(x = p)) +
+    geom_line(aes(y = Omission), linewidth = 1,colour = "orange") +
+    geom_line(aes(y = Commission), linewidth = 1,colour = "red")+
+    geom_line(data=Results_RM2$mod_P_RM2$allMeasures,aes(y = Omission), linewidth = 1,colour = "orange",lty=2) +
+    geom_line(data=Results_RM2$mod_P_RM2$allMeasures,aes(y = Commission), linewidth = 1,colour = "red",lty=2) +
+  labs(x = "Threshold Probability",y="omission and commission")+
+    theme_classic()
+
+p1_RM4 <- ggplot(Results_RM4$mod_u_RM4$allMeasures, aes(x = p)) +
+    geom_line(aes(y = kappa), linewidth = 1,colour = "blue") +
+    geom_line(data=Results_RM4$mod_P_RM4$allMeasures,aes(y = kappa,x = p), linewidth = 1,colour = "blue",lty=2) +
+  annotate("text",x=0.0,y=0.9,label = paste("Prev. = ",round(ThreshIndMeas_RM4$Prevalence[1],2)),size =3.5,hjust=0)+
+  annotate("text",x=0.0,y=0.82,label = aucText_RM4,size=3.5,hjust=0)+  
+  scale_y_continuous(limits = c(0,0.9))+
+      labs(x = "Threshold Probability",title = "Upland streams(R-M4)")+
+    theme_classic()+
+  theme(plot.title = element_text(size = 12, face = "bold")) 
+
+p3_RM4 <- ggplot(Results_RM4$mod_u_RM4$allMeasures, aes(x = p)) +
+    geom_line(aes(y = Omission), linewidth = 1,colour = "orange") +
+    geom_line(aes(y = Commission), linewidth = 1,colour = "red")+
+    geom_line(data=Results_RM4$mod_P_RM4$allMeasures,aes(y = Omission), linewidth = 1,colour = "orange",lty=2) +
+    geom_line(data=Results_RM4$mod_P_RM4$allMeasures,aes(y = Commission), linewidth = 1,colour = "red",lty=2) +
+  labs(x = "Threshold Probability",y="omission and commission")+
+    theme_classic()
+# ------------------------------------------------------------
+# Arrange Figure 6
+# ------------------------------------------------------------
+
+fig6 <- gridExtra::arrangeGrob(
+  p1_RM2, p1_RM4,
+  p3_RM2, p3_RM4,
+  ncol = 2,
+  nrow = 2
+)
+# Display figure
+grid::grid.newpage()
+grid::grid.draw(fig6)
+
+# ------------------------------------------------------------
+# Save Figure 6
+# ------------------------------------------------------------
+
+output_file <- here::here(
+  "Outputs", "Figures", "Figure_6.png"
+)
+
+dir.create(
+  dirname(output_file),
+  recursive = TRUE,
+  showWarnings = FALSE
+)
+
+ggplot2::ggsave(
+  filename = output_file,
+  plot = fig6,
+  width = 6.25,
+  height = 5,
+  units = "in",
+  dpi = 300
+)
+
+cat("Saved:", output_file, "\n")
+```
+
+### 4.2 Threshold summary for all five models
+
+This section summarises the probability thresholds obtained for the five selected models, together with the corresponding kappa, commission and omission values. Three threshold-selection criteria are considered: balancing commission and omission (`OmisComm`), minimising commission (`MinCom`) and minimising omission (`MinOm`).
+
+For the multivariate models, the probability threshold is selected using the `OmisComm` criterion. These thresholds are extracted automatically and used in the subsequent phosphorus boundary calculations and bootstrap analyses. The sensitivity analysis in Section 8 considers all three threshold-selection criteria.
+
+```{r threshold_summary}
+# Generate threshold summaries
+threshold_summary_RM2 <- getThresholdTable(Results_RM2)
+threshold_summary_RM4 <- getThresholdTable(Results_RM4)
+
+# One source for the selected probability threshold of each multivariate model.
+# "OmisComm" selects the balanced commission-omission criterion.
+# The selection criterion is fixed; the resulting probability is data-dependent.
+selected_multivariate_rule <- "OmisComm"
+
+get_selected_threshold <- function(summary_tab, model_name,
+                                   rule = selected_multivariate_rule) {
+  field <- paste0("threshold_", model_name)
+  if (!all(c("measure", field) %in% names(summary_tab))) {
+    stop("Missing 'measure' or '", field, "' in threshold summary")
+  }
+
+  p <- summary_tab[[field]][
+    !is.na(summary_tab$measure) & summary_tab$measure == rule
+  ]
+  if (length(p) != 1L || !is.numeric(p) ||
+      !is.finite(p) || p <= 0 || p >= 1) {
+    stop("Expected exactly one valid threshold (0 < p < 1) for ",
+         model_name, " using rule '", rule, "'")
+  }
+  as.numeric(p)
+}
+
+p_RM2 <- get_selected_threshold(threshold_summary_RM2, "mod_u_RM2")
+p_opt_RM4 <- get_selected_threshold(threshold_summary_RM4, "mod_u_RM4")
+p_add_RM4 <- get_selected_threshold(threshold_summary_RM4, "mod_u2_RM4")
+
+# Inspect the probabilities before running boundary predictions.
+print(data.frame(
+  Model = c("R-M2 optimal", "R-M4 optimal", "R-M4 additional"),
+  Rule = selected_multivariate_rule,
+  p = c(p_RM2, p_opt_RM4, p_add_RM4)
+))
+
+# Combine and reshape to produce threshold_results
+threshold_results <- bind_rows(
+  threshold_summary_RM2,
+  threshold_summary_RM4
+) %>%
+  filter(measure %in% c("OmisComm", "MinCom", "MinOm")) %>%
+  tidyr::pivot_longer(
+    cols = -measure,
+    names_to = c(".value", "model"),
+    names_pattern = "^(threshold|kappa|commission|omission)_(.*)$"
+  ) %>%
+  filter(!is.na(threshold)) %>%
+  mutate(
+    Model = dplyr::recode(
+  model,
+  "mod_P_RM2"  = "R-M2 univariate",
+  "mod_u_RM2"  = "R-M2 optimal",
+  "mod_P_RM4"  = "R-M4 univariate",
+  "mod_u_RM4"  = "R-M4 optimal",
+  "mod_u2_RM4" = "R-M4 additional"
+),
+    Rule = dplyr::recode(
+      measure,
+      "OmisComm" = "Balanced",
+      "MinCom"   = "Min Com",
+      "MinOm"    = "Min Om"
+    ),
+    p = threshold,
+    Commission = commission,
+    Omission = omission
+  ) %>%
+  select(Model, Rule, p, Commission, Omission, kappa)
+
+# Display results
+threshold_results
+
+
+```
+
+## 5. R-M2 phosphorus boundaries and bootstrap uncertainty
+
+### 5.1 Conditional boundary prediction
+
+In an additive multivariate model, the phosphorus concentration corresponding to a specified probability of Good status depends on the assumed values of the other predictors. Here the R-M2 optimal model is solved for P–PO4 using the probability threshold (`p_RM2`) selected dynamically in Section 4.2, for selected conductivity and HMS combinations. Conductivity is supplied on its original mS/cm scale and transformed internally by `create_pred_matrix()`; phosphorus is returned in the original model concentration units (µg P/L).
+
+The `create_pred_matrix()` output is a convenient rounded presentation grid. **Bootstrap confidence intervals, however, are calculated from unrounded coefficient-based solutions**, so interval limits are not distorted by display rounding.
+
+```{r RM2_boundary_grid}
+# Predicted phosphate (P_PO4) boundary values from the R-M2 multivariate model
+# Covariate ranges supplied in UNTRANSFORMED units; function applies log10 internally.
+
+# Specify the range of values to be used for each of the co-variates on non-transformed scale.
+# R-M2 covariate values
+Cond_vals_RM2 <- c(0.25, 0.31, 0.40, 0.43, 0.50, 0.644, 0.70) # conductivity (untransformed)
+HMS_vals_RM2  <- c(1, 3, 5, 9, 15, 20, 25) # Habitat Modification Score
+
+# Build prediction matrix
+out_RM2 <- create_pred_matrix(
+  model       = mod_u_RM2,                    # optimal R-M2 multivariate model name
+  p_target    = p_RM2,                        # dynamic probability from Section 4.2
+  target_var  = "L10P_PO4",                   # model variable to solve for (original units returned)
+  target_var_round = 0,                       # column rounding to display for target variable
+  row_var     = "L10Cond",                    # model variable to use as rows 
+  row_vals    = Cond_vals_RM2,                    # un-transformed values to use for rows; function will log10
+  row_round   = 2,                            # rounding to display for row variables
+  col_var     = "HMS",                        # model variable to use as columns
+  col_vals    = HMS_vals_RM2,                     # values to use for columns
+  log10_vars  = c("L10P_PO4","L10Cond"),      # predictors that were log10 in the model, (transform will be made by function)
+  other_fixed = list(),                       # add fixed predictors here if your model has more. None for R-M2
+  prefix = "PO4_pred_"                        # prefix for column labels
+)
+
+pred_mat_RM2  <- out_RM2$matrix               # get the predictions in form of a matrix
+results_w_RM2 <- out_RM2$results_wide         # get the predictions in the form of a tibble.
+
+
+```
+
+
+### 5.2 Site-level non-parametric bootstrap — R-M2
+
+With the R-M2 model structure and probability threshold held fixed, 1,000 bootstrap datasets are obtained by resampling site-averaged observations **with replacement**. The same logistic model is refitted to each sample, and conditional phosphorus boundaries are calculated at every conductivity–HMS combination. The 2.5th and 97.5th percentiles of the valid bootstrap estimates define percentile **95% confidence intervals**. Non-convergent fits or non-finite solutions are excluded from the affected grid cells and the number of valid estimates is reported.
+
+```{r bootstrap_RM2}
+
+# ------------------------------------------------------------
+# Bootstrap confidence intervals for R-M2 phosphorus boundaries
+# ------------------------------------------------------------
+
+library(dplyr)
+library(tidyr)
+
+set.seed(123)
+
+n_boot <- 1000
+
+# Define all combinations of conductivity and HMS
+grid_RM2 <- expand.grid(
+  Cond = Cond_vals_RM2,
+  HMS = HMS_vals_RM2,
+  KEEP.OUT.ATTRS = FALSE
+)
+
+# Calculate phosphorus boundaries from model coefficients
+# Returns values in original units (ug P/L)
+
+calc_boundary_RM2 <- function(model, grid, p_target) {
+
+  b <- coef(model)
+
+  required <- c(
+    "(Intercept)", "HMS", "L10Cond", "L10P_PO4"
+  )
+
+  # Return missing values if model coefficients are invalid
+  if (
+    any(!is.finite(b[required])) ||
+    abs(b["L10P_PO4"]) < 1e-8
+  ) {
+    return(rep(NA_real_, nrow(grid)))
+  }
+
+  boundary <- 10^(
+    (
+      qlogis(p_target) -
+      b["(Intercept)"] -
+      b["HMS"] * grid$HMS -
+      b["L10Cond"] * log10(grid$Cond)
+    ) / b["L10P_PO4"]
+  )
+
+  boundary[!is.finite(boundary)] <- NA_real_
+
+  as.numeric(boundary)
+}
+
+
+# ------------------------------------------------------------
+# Original boundary estimates (unrounded)
+# ------------------------------------------------------------
+
+boundary_RM2 <- calc_boundary_RM2(
+  mod_u_RM2,
+  grid_RM2,
+  p_RM2
+)
+
+
+# ------------------------------------------------------------
+# Bootstrap model refitting
+# ------------------------------------------------------------
+
+boot_results_RM2 <- replicate(n_boot, {
+
+  # Resample observations with replacement
+  boot_dat <- dat_RM2[
+    sample.int(nrow(dat_RM2), replace = TRUE),
+    ,
+    drop = FALSE
+  ]
+
+  # Refit the R-M2 optimal model
+  boot_mod <- tryCatch(
+    suppressWarnings(
+      glm(
+        formula(mod_u_RM2),
+        data = boot_dat,
+        family = binomial(link = "logit")
+      )
+    ),
+    error = function(e) NULL
+  )
+
+  # Calculate boundaries, excluding failed model fits
+  if (is.null(boot_mod) || !isTRUE(boot_mod$converged)) {
+    rep(NA_real_, nrow(grid_RM2))
+  } else {
+    calc_boundary_RM2(boot_mod, grid_RM2, p_RM2)
+  }
+
+})
+
+
+# ------------------------------------------------------------
+# Calculate percentile 95% confidence intervals
+# ------------------------------------------------------------
+
+boot_CI_RM2 <- t(
+  apply(boot_results_RM2, 1, function(x) {
+
+    x <- x[is.finite(x)]
+
+    if (length(x) < 2) {
+      return(c(NA_real_, NA_real_))
+    }
+
+    as.numeric(
+      quantile(x, probs = c(0.025, 0.975))
+    )
+  })
+)
+
+colnames(boot_CI_RM2) <- c("Lower95", "Upper95")
+
+
+# ------------------------------------------------------------
+# Combine original boundaries and confidence intervals
+# ------------------------------------------------------------
+
+results_boot_RM2 <- grid_RM2 %>%
+  mutate(
+    Boundary = boundary_RM2,
+    Lower95 = boot_CI_RM2[, 1],
+    Upper95 = boot_CI_RM2[, 2]
+  )
+
+
+# Check successful bootstrap estimates
+cat(
+  "Valid bootstrap estimates per grid combination:",
+  range(rowSums(is.finite(boot_results_RM2))),
+  "out of", n_boot, "\n"
+)
+
+
+```
+
+### 5.3 Table 4 — R-M2 conditional phosphorus boundaries
+
+Table 4 presents selected conductivity and HMS settings, with predicted boundaries from the original fitted model and bootstrap confidence limits in parentheses. The grey cell identifies the selected median conditions; blue shading identifies alternative lower-conductivity conditions considered during expert consultation.
+
+```{r RM2_boundary_CI_table}
+
+# ------------------------------------------------------------
+# Prepare table
+# ------------------------------------------------------------
+
+results_w_RM2_CI <- results_boot_RM2 %>%
+  filter(
+    HMS %in% c(3, 5, 9, 25),
+    Cond >= 0.31,
+    Cond <= 0.65
+  ) %>%
+  mutate(
+    Boundary_CI = sprintf(
+      "%.0f (%.0f–%.0f)",
+      Boundary, Lower95, Upper95
+    ),
+    HMS = paste0("HMS = ", HMS)
+  ) %>%
+  select(Cond, HMS, Boundary_CI) %>%
+  pivot_wider(
+    names_from = HMS,
+    values_from = Boundary_CI
+  ) %>%
+  arrange(Cond)
+
+
+# ------------------------------------------------------------
+# Create flextable
+# ------------------------------------------------------------
+
+ft_RM2_CI <- results_w_RM2_CI %>%
+
+  flextable() %>%
+
+  set_header_labels(
+    Cond = "Conductivity\n(mS/cm)",
+    `HMS = 3` = "HMS = 3",
+    `HMS = 5` = "HMS = 5",
+    `HMS = 9` = "HMS = 9 median",
+    `HMS = 25` = "HMS = 25"
+  ) %>%
+
+  align(align = "center", part = "all") %>%
+
+  colformat_double(
+    j = "Cond",
+    digits = 2
+  ) %>%
+
+  # Mark median conductivity
+  compose(
+    i = ~ abs(Cond - 0.43) < 0.0001,
+    j = "Cond",
+    value = as_paragraph("0.43 median")
+  ) %>%
+
+  theme_booktabs() %>%
+
+  # Grey shading: median prediction
+  bg(
+    i = ~ abs(Cond - 0.43) < 0.0001,
+    j = "HMS = 9",
+    bg = "#D9D9D9",
+    part = "body"
+  ) %>%
+
+  # Light blue shading: conductivity = 0.31
+  bg(
+    i = ~ abs(Cond - 0.31) < 0.0001,
+    bg = "#DDEBF7",
+    part = "body"
+  ) %>%
+
+  # Darker blue: conductivity = 0.31, HMS = 9
+  bg(
+    i = ~ abs(Cond - 0.31) < 0.0001,
+    j = "HMS = 9",
+    bg = "#9DC3E6",
+    part = "body"
+  ) %>%
+
+  autofit() %>%
+
+  set_caption(
+    caption = paste(
+      "Table 4",
+      "Predicted phosphorus boundary values (µg P/L) for lowland",
+      sprintf("(R-M2) rivers, based on a cut probability threshold of p = %.2f.", p_RM2),
+      "Boundaries are shown for selected combinations of conductivity",
+      "(mS/cm) and Habitat Modification Score (HMS).",
+      "Values in parentheses are bootstrap 95% confidence intervals.",
+      "The prediction based on median values is highlighted (grey),",
+      "as are options based on lower conductivity values (blue)",
+      "following consultation with national experts."
+    )
+  )
+
+
+# ------------------------------------------------------------
+# Display table
+# ------------------------------------------------------------
+
+ft_RM2_CI
+
+
+# ------------------------------------------------------------
+# Save to Word
+# ------------------------------------------------------------
+
+output_file <- here::here(
+  "Outputs", "Tables", "Table4_RM2_Boundaries_CI.docx"
+)
+
+dir.create(
+  dirname(output_file),
+  recursive = TRUE,
+  showWarnings = FALSE
+)
+
+flextable::save_as_docx(
+  ft_RM2_CI,
+  path = output_file
+)
+
+cat("Saved:", output_file, "\n")
+
+```                                                                                                                                                                         
+
+### 5.4 Figure S3 — R-M2 boundary curves
+
+The fitted phosphorus boundaries are plotted against conductivity for three HMS values and overlaid on the observed phosphate–conductivity distribution. Reference lines indicate the selected conductivity and corresponding phosphorus boundary, calculated directly from the fitted model.
+
+```{r Figure_S3, fig.width=7, fig.height=5}
+
+# ------------------------------------------------------------
+# 1. Prepare predicted phosphorus boundaries for HMS = 3, 5, 9
+# ------------------------------------------------------------
+
+results_long <- results_w_RM2 %>%
+  select(
+    L10Cond_orig,
+    `PO4_pred_HMS=3`,
+    `PO4_pred_HMS=5`,
+    `PO4_pred_HMS=9`
+  ) %>%
+  pivot_longer(
+    cols = starts_with("PO4_pred_"),
+    names_to = "HMS_raw",
+    values_to = "PO4_pred"
+  ) %>%
+  mutate(
+    HMS = sub("PO4_pred_", "", HMS_raw),
+    HMS = factor(HMS, levels = c("HMS=3", "HMS=5", "HMS=9"))
+  ) %>%
+  arrange(HMS, L10Cond_orig)
+
+
+# ------------------------------------------------------------
+# 2. Extract selected phosphorus boundary dynamically
+#    Conductivity = 0.31 mS/cm, HMS = 9
+# ------------------------------------------------------------
+
+selected_cond <- 0.31
+selected_HMS  <- 9
+
+boundary_selected <- results_boot_RM2 %>%
+  filter(
+    abs(Cond - selected_cond) < 0.0001,
+    HMS == selected_HMS
+  ) %>%
+  pull(Boundary)
+
+stopifnot(
+  length(boundary_selected) == 1,
+  is.finite(boundary_selected)
+)
+
+# Rounded value for annotation
+boundary_label <- round(boundary_selected, 0)
+
+cat("Selected phosphorus boundary:", boundary_label, "ug P/L\n")
+
+
+# ------------------------------------------------------------
+# 3. Create Figure S3
+# ------------------------------------------------------------
+
+fig_S3 <- ggplot(
+  dat_RM2,
+  aes(
+    x = 10^L10Cond,
+    y = 10^L10P_PO4,
+    colour = factor(BinClass_HESY)
+  )
+) +
+
+  # Original observations
+  geom_point() +
+
+  scale_x_log10() +
+  scale_y_log10() +
+
+  labs(
+    x = expression("Conductivity (mS cm"^{-1} * ")"),
+    y = expression("P–PO"[4]^"3-" ~ "(" * mu * "g P L"^{-1} * ")"),
+    colour = stringr::str_wrap(
+      "zoobenthos binary class", width = 13
+    )
+  ) +
+
+  # Separate colour scale for predicted boundaries
+  ggnewscale::new_scale_color() +
+
+  # Predicted phosphorus boundaries
+  geom_line(
+    data = results_long,
+    aes(
+      x = L10Cond_orig,
+      y = PO4_pred,
+      colour = HMS
+    ),
+    inherit.aes = FALSE,
+    linewidth = 1
+  ) +
+
+  scale_colour_manual(
+    name = stringr::str_wrap(
+      "predicted good/moderate boundary", width = 13
+    ),
+    values = c(
+      "HMS=3" = "#1b9e77",
+      "HMS=5" = "#d95f02",
+      "HMS=9" = "#7570b3"
+    ),
+    labels = c(
+      "HMS=3" = "HMS = 3",
+      "HMS=5" = "HMS = 5",
+      "HMS=9" = "HMS = 9"
+    )
+  ) +
+
+  # Highlight conductivity = 0.31
+  geom_vline(
+    xintercept = selected_cond,
+    linetype = 3,
+    colour = "red"
+  ) +
+
+  # Highlight predicted phosphorus boundary
+  geom_hline(
+    yintercept = boundary_selected,
+    linetype = 3,
+    colour = "red"
+  ) +
+
+  # Label predicted phosphorus boundary
+  annotate(
+    "text",
+    x = selected_cond * 1.02,
+    y = boundary_selected,
+    label = as.character(boundary_label),
+    vjust = -0.5,
+    size = 3.5
+  ) +
+
+  theme_classic(base_size = 13)
+
+
+# ------------------------------------------------------------
+# 4. Display figure
+# ------------------------------------------------------------
+
+fig_S3
+
+
+# ------------------------------------------------------------
+# 5. Save Figure S3
+# ------------------------------------------------------------
+
+output_file <- here::here(
+  "Outputs", "Figures", "Figure_S3.png"
+)
+
+dir.create(
+  dirname(output_file),
+  recursive = TRUE,
+  showWarnings = FALSE
+)
+
+ggsave(
+  filename = output_file,
+  plot = fig_S3,
+  width = 7,
+  height = 5,
+  dpi = 300,
+  units = "in"
+)
+
+cat("Saved:", output_file, "\n")
+
+```
+
+## 6. R-M4 phosphorus boundaries and bootstrap uncertainty
+
+For R-M4, the **optimal** model contains phosphate and HMS, whereas the **additional** model also contains DO. These alternative model structures are reported separately and evaluated using their respective probability thresholds (p_opt_RM4 and p_add_RM4), obtained dynamically from the threshold summaries in Section 4.2. As for R-M2, the boundaries are solutions for the specified probability of Good ecological status conditional on the other environmental variables.
+
+### 6.1 R-M4 optimal model: HMS-dependent boundaries
+
+```{r RM4_optimal_boundaries}
+
+# ------------------------------------------------------------
+# R-M4 optimal model: predicted phosphorus boundaries
+# ------------------------------------------------------------
+
+# HMS values (25th percentile, median and 75th percentile)
+HMS_vals_RM4 <- c(2, 7, 15)
+
+# Calculate predicted phosphorus boundaries
+out_RM4_opt <- create_pred_matrix(
+  model            = mod_u_RM4,                # optimal R-M4 multivariate model
+  p_target         = p_opt_RM4,                # dynamic probability from Section 4.2
+  target_var       = "L10P_PO4",              # model variable to solve for (original units returned)
+  target_var_round = 0,                       # column rounding to display for target variable
+  row_var          = "HMS",                   # model variable to use as rows
+  row_vals         = HMS_vals_RM4,            # values to use for rows
+  row_round        = 0,                       # rounding to display for row variables
+  log10_vars       = "L10P_PO4",
+  other_fixed      = list(),                  # add fixed predictors here if your model has more. None for R-M4
+  prefix           = "PO4_pred_"              # prefix for column labels
+)
+
+# Store results using R-M4-specific names
+pred_mat_RM4_opt <- out_RM4_opt$matrix
+results_w_RM4 <- out_RM4_opt$results_wide
+
+# Display results
+results_w_RM4
+```
+
+### 6.2 R-M4 additional model: DO- and HMS-dependent boundaries
+
+```{r RM4_additional_boundaries}
+
+# ------------------------------------------------------------
+# R-M4 additional model: predicted phosphorus boundaries
+# ------------------------------------------------------------
+# Predicted phosphate (P_PO4) boundaries from the R-M4 additional model
+
+# Specify the range of values to be used for each of the co-variates on non-transformed scale.
+DO_vals_RM4  <- c(7,7.5,8,8.5,9,9.7,10,10.5,11,11.5)  # dissolved oxygen 
+# HMS values (25th percentile, median and 75th percentile)
+HMS_vals_RM4 <- c(2, 7, 15)
+
+out_RM4_add <- create_pred_matrix(
+  model            = mod_u2_RM4,
+  p_target         = p_add_RM4,               # dynamic probability from Section 4.2
+  target_var       = "L10P_PO4",
+  target_var_round = 0,
+  row_var          = "DO",
+  row_vals         = DO_vals_RM4,
+  row_round        = 2,
+  col_var          = "HMS",
+  col_vals         = HMS_vals_RM4,
+  log10_vars       = "L10P_PO4",
+  other_fixed      = list(),
+  prefix           = "PO4_pred_"
+)
+
+pred_mat_RM4_add <- out_RM4_add$matrix
+results_w_RM4_add <- out_RM4_add$results_wide
+```
+
+### 6.3 Common bootstrap for both R-M4 models
+
+Both models are refitted on **the same 1,000 site-level bootstrap samples**. The optimal model is evaluated at HMS = 2, 7 and 15; the additional model is evaluated over a grid of six selected DO values and the same three HMS values. The original fitted-model predictions and percentile 95% confidence intervals are stored separately for the two models. The Table 5 grids are intentionally kept restricted to these manuscript settings; the extended HMS grid for Figure S5 is generated later without disturbing Table 5.
+
+```{r bootstrap_RM4, message=FALSE}
+
+# ------------------------------------------------------------
+# 1. Define the prediction grids for Table 5
+# ------------------------------------------------------------
+
+#values used in Table 5
+
+HMS_vals_RM4 <- c(2, 7, 15)
+
+DO_vals_RM4_table <- c(
+  8, 8.5, 9, 9.7, 10, 10.5
+)
+
+# Optimal model: HMS only
+grid_opt_RM4 <- tibble(
+  HMS = HMS_vals_RM4
+)
+
+# Additional model: combinations of DO and HMS
+grid_add_RM4 <- tidyr::expand_grid(
+  DO = DO_vals_RM4_table,
+  HMS = HMS_vals_RM4
+)
+
+# Use p_opt_RM4 and p_add_RM4 derived from the threshold summaries
+# in Section 4.2; do not overwrite them with fixed numerical values.
+
+
+# ------------------------------------------------------------
+# 2. Function to calculate unrounded phosphorus boundaries
+# ------------------------------------------------------------
+
+calc_boundary_RM4 <- function(model, grid, p_target) {
+
+  b <- coef(model)
+
+  required <- c(
+    "(Intercept)", "HMS", "L10P_PO4"
+  )
+
+  if ("DO" %in% names(grid)) {
+    required <- c(required, "DO")
+  }
+
+  # Return NA if coefficients are invalid
+  if (
+    any(!is.finite(b[required])) ||
+    abs(b["L10P_PO4"]) < 1e-8
+  ) {
+    return(rep(NA_real_, nrow(grid)))
+  }
+
+  # Linear predictor excluding phosphorus
+  lp <- b["(Intercept)"] +
+    b["HMS"] * grid$HMS
+
+  if ("DO" %in% names(grid)) {
+    lp <- lp + b["DO"] * grid$DO
+  }
+
+  # Solve for phosphorus concentration
+  boundary <- 10^(
+    (qlogis(p_target) - lp) / b["L10P_PO4"]
+  )
+
+  boundary[!is.finite(boundary)] <- NA_real_
+
+  as.numeric(boundary)
+}
+
+
+# ------------------------------------------------------------
+# 3. Original model predictions (unrounded)
+# ------------------------------------------------------------
+
+boundary_opt_RM4 <- calc_boundary_RM4(
+  mod_u_RM4,
+  grid_opt_RM4,
+  p_opt_RM4
+)
+
+boundary_add_RM4 <- calc_boundary_RM4(
+  mod_u2_RM4,
+  grid_add_RM4,
+  p_add_RM4
+)
+
+
+# ------------------------------------------------------------
+# 4. Prepare bootstrap dataset
+# ------------------------------------------------------------
+
+dat_RM4_boot <- model.frame(mod_u2_RM4)
+
+stopifnot(
+  nrow(dat_RM4_boot) == nobs(mod_u_RM4),
+  nrow(dat_RM4_boot) == nobs(mod_u2_RM4)
+)
+
+nrow(dat_RM4_boot)  # Expected: 85
+
+
+# ------------------------------------------------------------
+# 5. Bootstrap both models using identical resamples
+# ------------------------------------------------------------
+
+set.seed(123)
+
+n_boot <- 1000
+
+# Matrices to store bootstrap predictions
+boot_opt_RM4 <- matrix(
+  NA_real_,
+  nrow = nrow(grid_opt_RM4),
+  ncol = n_boot
+)
+
+boot_add_RM4 <- matrix(
+  NA_real_,
+  nrow = nrow(grid_add_RM4),
+  ncol = n_boot
+)
+
+for (i in seq_len(n_boot)) {
+  message("Bootstrap iteration:", i, "of", n_boot, "\n")
+  # Resample site observations
+  idx <- sample.int(
+    nrow(dat_RM4_boot),
+    replace = TRUE
+  )
+
+  boot_data <- dat_RM4_boot[idx, , drop = FALSE]
+
+  # Refit optimal model
+  mod_opt <- tryCatch(
+    suppressWarnings(
+      glm(
+        formula(mod_u_RM4),
+        data = boot_data,
+        family = binomial(link = "logit")
+      )
+    ),
+    error = function(e) NULL
+  )
+
+  # Refit additional model
+  mod_add <- tryCatch(
+    suppressWarnings(
+      glm(
+        formula(mod_u2_RM4),
+        data = boot_data,
+        family = binomial(link = "logit")
+      )
+    ),
+    error = function(e) NULL
+  )
+
+  # Optimal model boundaries
+  if (!is.null(mod_opt) && isTRUE(mod_opt$converged)) {
+
+    boot_opt_RM4[, i] <- calc_boundary_RM4(
+      mod_opt,
+      grid_opt_RM4,
+      p_opt_RM4
+    )
+  }
+
+  # Additional model boundaries
+  if (!is.null(mod_add) && isTRUE(mod_add$converged)) {
+
+    boot_add_RM4[, i] <- calc_boundary_RM4(
+      mod_add,
+      grid_add_RM4,
+      p_add_RM4
+    )
+  }
+}
+
+
+# ------------------------------------------------------------
+# 6. Calculate bootstrap percentile confidence intervals
+# ------------------------------------------------------------
+
+bootstrap_quantiles <- function(x) {
+
+  x <- x[is.finite(x)]
+
+  if (length(x) < 2) {
+    return(c(NA_real_, NA_real_, NA_real_))
+  }
+
+  as.numeric(
+    quantile(x, probs = c(0.025, 0.50, 0.975))
+  )
+}
+
+# Optimal model
+CI_opt_RM4 <- t(
+  apply(boot_opt_RM4, 1, bootstrap_quantiles)
+)
+
+# Additional model
+CI_add_RM4 <- t(
+  apply(boot_add_RM4, 1, bootstrap_quantiles)
+)
+
+colnames(CI_opt_RM4) <- c("Lower95", "Median", "Upper95")
+colnames(CI_add_RM4) <- c("Lower95", "Median", "Upper95")
+
+
+# ------------------------------------------------------------
+# 7. Combine model predictions and confidence intervals
+# ------------------------------------------------------------
+
+results_boot_RM4_opt <- grid_opt_RM4 %>%
+  mutate(
+    Boundary = boundary_opt_RM4,
+    Lower95 = CI_opt_RM4[, "Lower95"],
+    Median = CI_opt_RM4[, "Median"],
+    Upper95 = CI_opt_RM4[, "Upper95"],
+    N_boot = rowSums(is.finite(boot_opt_RM4))
+  )
+
+results_boot_RM4_add <- grid_add_RM4 %>%
+  mutate(
+    Boundary = boundary_add_RM4,
+    Lower95 = CI_add_RM4[, "Lower95"],
+    Median = CI_add_RM4[, "Median"],
+    Upper95 = CI_add_RM4[, "Upper95"],
+    N_boot = rowSums(is.finite(boot_add_RM4))
+  )
+
+
+# Display results
+results_boot_RM4_opt
+results_boot_RM4_add
+
+# Check number of successful bootstrap estimates
+cat(
+  "Optimal model valid estimates:",
+  range(results_boot_RM4_opt$N_boot), "\n"
+)
+
+cat(
+  "Additional model valid estimates:",
+  range(results_boot_RM4_add$N_boot), "\n"
+)
+
+```
+
+### 6.4 Selected R-M4 scenarios
+
+This section summarises the predicted phosphorus boundaries and bootstrap 95% confidence intervals for the R-M4 optimal model at HMS = 7 and the additional model at HMS = 7, using DO concentrations of 9.7 mg/L (the median) and 10 mg/L.
+
+```{r RM4_selected_boundary_summary}
+
+summary_boot_RM4 <- bind_rows(
+
+  results_boot_RM4_opt %>%
+    filter(HMS == 7) %>%
+    mutate(Model = "R-M4 optimal"),
+
+  results_boot_RM4_add %>%
+    filter(HMS == 7, DO %in% c(9.7, 10)) %>%
+    mutate(
+      Model = if_else(
+        DO == 9.7,
+        "R-M4 additional median DO",
+        "R-M4 additional DO=10"
+      )
+    )
+
+) %>%
+  select(
+    Model, N_boot, Boundary,
+    Lower95, Median, Upper95
+  )
+
+summary_boot_RM4
+
+```
+
+### 6.5 Table 5 — R-M4 boundaries and confidence intervals
+
+Table 5 combines the two model structures in one table. It retains the three original HMS values, uses the bootstrap intervals from Section 6.3, and highlights the median and alternative DO conditions. The Word table is completed **before** Figure S4 so the table and figure can be checked against the same scenario definitions.
+
+```{r table5_RM4_data}
+
+# ------------------------------------------------------------
+# Optimal model
+# ------------------------------------------------------------
+
+tab_opt <- results_boot_RM4_opt %>%
+  mutate(
+    Model = "Optimal",
+    DO = NA_real_,
+    Boundary_CI = sprintf(
+      "%.0f (%.0f–%.0f)",
+      Boundary, Lower95, Upper95
+    )
+  )
+
+# ------------------------------------------------------------
+# Additional model
+# ------------------------------------------------------------
+
+tab_add <- results_boot_RM4_add %>%
+  mutate(
+    Model = "Additional",
+    Boundary_CI = sprintf(
+      "%.0f (%.0f–%.0f)",
+      Boundary, Lower95, Upper95
+    )
+  )
+
+# ------------------------------------------------------------
+# Combine into Table 5
+# ------------------------------------------------------------
+
+table_RM4_CI <- bind_rows(tab_opt, tab_add) %>%
+  mutate(
+    HMS = factor(
+      paste0("HMS = ", HMS),
+      levels = c("HMS = 2", "HMS = 7", "HMS = 15")
+    ),
+    Model = factor(
+      Model,
+      levels = c("Optimal", "Additional")
+    )
+  ) %>%
+  select(Model, DO, HMS, Boundary_CI) %>%
+  pivot_wider(
+    names_from = HMS,
+    values_from = Boundary_CI
+  ) %>%
+  arrange(Model, DO) %>%
+  mutate(Model = as.character(Model))
+
+table_RM4_CI
+
+```
+
+```{r table5_RM4_flextable}
+
+# Identify rows for highlighting
+row_median <- which(
+  table_RM4_CI$Model == "Additional" &
+    !is.na(table_RM4_CI$DO) &
+    abs(table_RM4_CI$DO - 9.7) < 0.0001
+)
+
+row_DO10 <- which(
+  table_RM4_CI$Model == "Additional" &
+    !is.na(table_RM4_CI$DO) &
+    abs(table_RM4_CI$DO - 10) < 0.0001
+)
+
+# ------------------------------------------------------------
+# Create flextable
+# ------------------------------------------------------------
+
+ft_RM4_CI <- flextable(table_RM4_CI) %>%
+
+  set_header_labels(
+    Model = "Model",
+    DO = "DO (mg/L)",
+    `HMS = 2` = "HMS = 2",
+    `HMS = 7` = "HMS = 7 median",
+    `HMS = 15` = "HMS = 15"
+  ) %>%
+
+  colformat_double(
+    j = "DO",
+    digits = 1,
+    na_str = ""
+  ) %>%
+
+  align(align = "center", part = "all") %>%
+
+  theme_booktabs() %>%
+
+  # Mark median DO
+  compose(
+    i = row_median,
+    j = "DO",
+    value = as_paragraph("9.7 median")
+  ) %>%
+
+  # Grey shading for median HMS and DO
+  bg(
+    i = row_median,
+    j = "HMS = 7",
+    bg = "#D9D9D9",
+    part = "body"
+  ) %>%
+
+  # Blue shading for DO = 10 and HMS = 7
+  bg(
+    i = row_DO10,
+    j = "HMS = 7",
+    bg = "#9DC3E6",
+    part = "body"
+  ) %>%
+
+  autofit() %>%
+
+  set_caption(
+    caption = paste(
+      "Table 5",
+      "Predicted phosphorus boundary values (µg P/L) for",
+      "mountain (R-M4) rivers, based on probability thresholds",
+      sprintf("of p = %.2f for the optimal model and p = %.2f for the",
+              p_opt_RM4, p_add_RM4),
+      "additional model. Boundaries are shown for selected",
+      "combinations of Habitat Modification Score (HMS) and",
+      "dissolved oxygen (DO). Values in parentheses are bootstrap",
+      "95% confidence intervals. The prediction based on median",
+      "values is highlighted (grey), and the alternative prediction",
+      "at DO = 10 mg/L is highlighted (blue)."
+    )
+  )
+
+
+# ------------------------------------------------------------
+# Display table
+# ------------------------------------------------------------
+
+ft_RM4_CI
+
+
+# ------------------------------------------------------------
+# Save to Word
+# ------------------------------------------------------------
+
+output_file <- here::here(
+  "Outputs", "Tables", "Table5_RM4_Boundaries_CI.docx"
+)
+
+dir.create(
+  dirname(output_file),
+  recursive = TRUE,
+  showWarnings = FALSE
+)
+
+flextable::save_as_docx(
+  ft_RM4_CI,
+  path = output_file
+)
+
+cat("Saved:", output_file, "\n")
+
+```
+
+### 6.6 Figure S4 — R-M4 conditional boundary curves
+
+Panel (a) shows predictions from the additional model at three HMS values, with horizontal references evaluated at **DO = 9.7 mg/L** to match Table 5. Panel (b) highlights the model-based boundary for **DO = 10 mg/L and HMS = 7**. These displayed values come from the fitted model rather than hard-coded manuscript numbers.
+
+```{r Figure_S4, fig.width=7, fig.height=10}
+
+# ------------------------------------------------------------
+# 1. Prepare predicted phosphorus boundaries for HMS = 2, 7, 15
+# ------------------------------------------------------------
+
+results_long_RM4 <- results_w_RM4_add %>%
+  select(
+    DO_orig,
+    `PO4_pred_HMS=2`,
+    `PO4_pred_HMS=7`,
+    `PO4_pred_HMS=15`
+  ) %>%
+  pivot_longer(
+    cols = starts_with("PO4_pred_"),
+    names_to = "HMS_raw",
+    values_to = "PO4_pred"
+  ) %>%
+  mutate(
+    HMS = sub("PO4_pred_HMS=", "HMS", HMS_raw),
+    HMS = factor(HMS, levels = c("HMS2", "HMS7", "HMS15"))
+  ) %>%
+  arrange(HMS, DO_orig)
+
+
+# ------------------------------------------------------------
+# 2. Calculate boundary values for panel (a): median DO
+# ------------------------------------------------------------
+
+median_DO <- 9.7
+
+# Prediction grid at median DO
+bound_vals_median <- tibble(
+  HMS = HMS_vals_RM4,
+  DO = median_DO
+)
+
+# Calculate phosphorus boundaries directly from fitted model
+bound_vals_median$Boundary <- calc_boundary_RM4(
+  mod_u2_RM4,
+  bound_vals_median,
+  p_target = p_add_RM4
+)
+
+cat("Median DO:", median_DO, "mg/L\n")
+print(bound_vals_median)
+
+
+# ------------------------------------------------------------
+# 3. Calculate boundary for panel (b): DO = 10, HMS = 7
+# ------------------------------------------------------------
+
+selected_DO  <- 10
+selected_HMS <- 7
+
+boundary_DO10 <- calc_boundary_RM4(
+  mod_u2_RM4,
+  tibble(
+    HMS = selected_HMS,
+    DO = selected_DO
+  ),
+  p_target = p_add_RM4
+)
+
+stopifnot(
+  length(boundary_DO10) == 1,
+  is.finite(boundary_DO10),
+  all(is.finite(bound_vals_median$Boundary))
+)
+
+boundary_label <- round(boundary_DO10, 0)
+
+cat(
+  "Phosphorus boundary at DO = 10, HMS = 7:",
+  boundary_label, "ug P/L\n"
+)
+
+
+# ------------------------------------------------------------
+# 4. Create the common plot for both panels
+# ------------------------------------------------------------
+
+base_plot_RM4 <- ggplot(
+  dat_RM4,
+  aes(
+    x = DO,
+    y = 10^L10P_PO4,
+    colour = factor(BinClass_HESY)
+  )
+) +
+
+  # Original observations
+  geom_point() +
+
+  scale_y_log10() +
+
+  labs(
+    x = expression("DO (mg L"^{-1} * ")"),
+    y = expression("P–PO"[4]^"3-" ~ "(" * mu * "g P L"^{-1} * ")"),
+    colour = stringr::str_wrap(
+      "zoobenthos binary class", width = 13
+    )
+  ) +
+
+  # Separate colour scale for predicted phosphorus boundaries
+  ggnewscale::new_scale_color() +
+
+  geom_line(
+    data = results_long_RM4,
+    aes(
+      x = DO_orig,
+      y = PO4_pred,
+      colour = HMS
+    ),
+    inherit.aes = FALSE,
+    linewidth = 1
+  ) +
+
+  scale_colour_manual(
+    name = stringr::str_wrap(
+      "predicted good/moderate boundary", width = 13
+    ),
+    values = c(
+      HMS2 = "#1b9e77",
+      HMS7 = "#d95f02",
+      HMS15 = "#7570b3"
+    ),
+    labels = c(
+      HMS2 = "HMS = 2",
+      HMS7 = "HMS = 7",
+      HMS15 = "HMS = 15"
+    )
+  ) +
+
+  theme_classic(base_size = 13)
+
+
+# ------------------------------------------------------------
+# 5. Panel (a): median DO, boundaries for all three HMS values
+# ------------------------------------------------------------
+
+p_S4a <- base_plot_RM4 +
+
+  # Median DO
+  geom_vline(
+    xintercept = median_DO,
+    linetype = 2
+  ) +
+
+  # Predicted boundaries for HMS = 2, 7, 15
+  geom_hline(
+    data = bound_vals_median,
+    aes(yintercept = Boundary),
+    inherit.aes = FALSE,
+    linetype = 2
+  ) +
+
+  # Label each boundary
+  geom_text(
+    data = bound_vals_median,
+    aes(
+      x = median_DO * 1.02,
+      y = Boundary,
+      label = round(Boundary)
+    ),
+    inherit.aes = FALSE,
+    vjust = -0.5,
+    size = 3.5
+  )
+
+
+# ------------------------------------------------------------
+# 6. Panel (b): DO = 10, HMS = 7
+# ------------------------------------------------------------
+
+p_S4b <- base_plot_RM4 +
+
+  # DO = 10 mg/L
+  geom_vline(
+    xintercept = selected_DO,
+    linetype = 3,
+    colour = "red"
+  ) +
+
+  # Predicted phosphorus boundary
+  geom_hline(
+    yintercept = boundary_DO10,
+    linetype = 3,
+    colour = "red"
+  ) +
+
+  # Label selected phosphorus boundary
+  annotate(
+    "text",
+    x = selected_DO * 1.02,
+    y = boundary_DO10,
+    label = as.character(boundary_label),
+    vjust = -0.5,
+    size = 3.5
+  )
+
+
+# ------------------------------------------------------------
+# 7. Combine panels into Figure S4
+# ------------------------------------------------------------
+
+fig_S4 <- gridExtra::arrangeGrob(
+  p_S4a,
+  p_S4b,
+  ncol = 1,
+  nrow = 2
+)
+
+# Display combined figure
+grid::grid.newpage()
+grid::grid.draw(fig_S4)
+
+
+# ------------------------------------------------------------
+# 8. Save Figure S4
+# ------------------------------------------------------------
+
+output_file <- here::here(
+  "Outputs", "Figures", "Figure_S4_RM4.png"
+)
+
+dir.create(
+  dirname(output_file),
+  recursive = TRUE,
+  showWarnings = FALSE
+)
+
+ggsave(
+  filename = output_file,
+  plot = fig_S4,
+  width = 7,
+  height = 10,
+  dpi = 300,
+  units = "in"
+)
+
+cat("Saved:", output_file, "\n")
+
+```
+
+
+
+### 6.7 Table 6 — Selected phosphorus boundaries and operational scenarios
+
+This summary draws its probability cut-offs from Section 4.2 and its unrounded phosphorus boundary estimates and bootstrap confidence intervals from Sections 5.2 and 6.3. It reproduces the five scenarios in manuscript Table 6: two R-M2 scenarios and three R-M4 scenarios. **No phosphorus boundary or probability is entered as a constant.** The covariate settings are retained as explicit
+management/expert-selected scenarios, rather than automatically changing when new data are analysed. Consequently, the terms *median* and *25th percentile* should be reviewed against the data if the input dataset changes.
+
+The R-M4 median-condition comparison (22 µg P/L in the original analysis) is based on the *optimal* model; the additional-model median-DO scenario is also shown separately (32 µg P/L originally). The operational R-M4 boundary is from the *additional* model at DO = 10 mg/L and HMS = 7.
+
+```{r table6_selected_boundaries}
+# Extract exactly one scenario row from an existing bootstrap summary.
+# Conditions after 'data' refer only to the environmental prediction grid.
+table6_row <- function(data, ..., scenario, river_type, criterion,
+                       model, p, covariates, rationale) {
+  row <- dplyr::filter(data, ...)
+
+  if (nrow(row) != 1L) {
+    stop("Table 6: expected exactly one prediction for ", scenario,
+         "; obtained ", nrow(row))
+  }
+
+  estimates <- c(row$Boundary, row$Lower95, row$Upper95)
+  if (length(estimates) != 3L || any(!is.finite(estimates))) {
+    stop("Table 6: missing/invalid prediction or bootstrap CI for ", scenario)
+  }
+
+  tibble::tibble(
+    Scenario = scenario,
+    River_type = river_type,
+    Criterion = criterion,
+    Model = model,
+    p = p,
+    Covariates = covariates,
+    Boundary = row$Boundary,
+    Lower95 = row$Lower95,
+    Upper95 = row$Upper95,
+    Rationale = rationale
+  )
+}
+
+# These covariates are the specific reference/operational scenarios
+# chosen for the manuscript. The resulting P boundaries are dynamic.
+table6_data <- dplyr::bind_rows(
+  table6_row(
+    results_boot_RM2,
+    dplyr::near(Cond, 0.43), HMS == 9,
+    scenario = "RM2_median", river_type = "R-M2",
+    criterion = "Median conditions",
+    model = "Optimal: HMS + Cond + P", p = p_RM2,
+    covariates = "Cond 0.43 mS/cm (median); HMS 9 (median)",
+    rationale = "Prevailing environmental conditions in the reference dataset"
+  ),
+  table6_row(
+    results_boot_RM2,
+    dplyr::near(Cond, 0.31), HMS == 9,
+    scenario = "RM2_operational", river_type = "R-M2",
+    criterion = "Operational",
+    model = "Optimal: HMS + Cond + P", p = p_RM2,
+    covariates = "Cond 0.31 mS/cm (25th percentile); HMS 9 (median)",
+    rationale = paste(
+      "Lower conductivity represents a manageable diffuse agricultural pressure;",
+      "HMS is retained at the median because remediation can be difficult"
+    )
+  ),
+  table6_row(
+    results_boot_RM4_opt,
+    HMS == 7,
+    scenario = "RM4_opt_median", river_type = "R-M4",
+    criterion = "Median conditions",
+    model = "Optimal: HMS + P", p = p_opt_RM4,
+    covariates = "HMS 7 (median)",
+    rationale = "Most parsimonious model under median HMS"
+  ),
+  table6_row(
+    results_boot_RM4_add,
+    dplyr::near(DO, 9.7), HMS == 7,
+    scenario = "RM4_add_median", river_type = "R-M4",
+    criterion = "Median conditions",
+    model = "Additional: HMS + DO + P", p = p_add_RM4,
+    covariates = "DO 9.7 mg/L (median); HMS 7 (median)",
+    rationale = "Additional model (lowest AICc) under median conditions"
+  ),
+  table6_row(
+    results_boot_RM4_add,
+    dplyr::near(DO, 10), HMS == 7,
+    scenario = "RM4_operational", river_type = "R-M4",
+    criterion = "Operational",
+    model = "Additional: HMS + DO + P", p = p_add_RM4,
+    covariates = "DO 10 mg/L; HMS 7 (median)",
+    rationale = paste(
+      "High but environmentally realistic and potentially manageable DO;",
+      "HMS retained at the median"
+    )
+  )
+)
+
+# An authoritative four-row table for the subsequent comparison of
+# fixed phosphorus criteria against observed HESY2 status. These values
+# are rounded to whole µg P/L, as in the manuscript.
+selected_boundaries <- table6_data %>%
+  dplyr::filter(Scenario %in% c(
+    "RM2_median", "RM2_operational", "RM4_opt_median", "RM4_operational"
+  )) %>%
+  dplyr::transmute(
+    River_type,
+    Criterion = if_else(Criterion == "Operational", "Operational", "Median"),
+    Boundary = round(Boundary, 0)
+  )
+
+stopifnot(nrow(table6_data) == 5L, nrow(selected_boundaries) == 4L)
+
+# Numerical review before formatting
+print(table6_data)
+print(selected_boundaries)
+```
+
+```{r table6_word_export}
+# Format the dynamic probabilities and predictions for manuscript Table 6.
+# The interpretation/rationale remains editorial, not a model output.
+rule_label <- dplyr::recode(
+  selected_multivariate_rule,
+  "OmisComm" = "Omis = Comm",
+  "MinCom" = "Min Com",
+  "MinOm" = "Min Om",
+  .default = selected_multivariate_rule
+)
+
+table6_word <- table6_data %>%
+  dplyr::mutate(
+    Probability = sprintf("%.2f (%s)", p, rule_label),
+    Boundary_CI = sprintf("%.0f (%.0f–%.0f)", Boundary, Lower95, Upper95),
+    Covariates = Covariates %>%
+      stringr::str_replace_all(
+        c(
+          "mg/L" = "mg L⁻¹",
+          "mS/cm" = "mS cm⁻¹"
+        )
+      )
+  ) %>%
+  dplyr::select(
+    River_type, Criterion, Model, Probability,
+    Covariates, Boundary_CI, Rationale
+  )
+
+ft_table6 <- flextable::flextable(table6_word) %>%
+  flextable::set_header_labels(
+    River_type = "River type",
+    Criterion = "Criterion",
+    Model = "Model",
+    Probability = "Probability threshold",
+    Covariates = "Covariate values",
+    Boundary_CI = "P boundary (µg P L⁻¹)",
+    Rationale = "Rationale"
+  ) %>%
+  flextable::theme_booktabs() %>%
+  flextable::bg(
+    i = table6_word$Criterion == "Operational",
+    bg = "#E7F1FA", part = "body"
+  ) %>%
+  flextable::fontsize(size = 9, part = "all") %>%
+  flextable::valign(valign = "top", part = "body") %>%
+  flextable::autofit() %>%
+  flextable::set_caption(
+    paste0(
+      "Table 6. Models, probability thresholds and environmental conditions ",
+      "used to derive phosphorus boundaries for R-M2 and R-M4 rivers. ",
+      "Parentheses show bootstrap 95% confidence intervals."
+    )
+  )
+
+# Word output is landscape to accommodate the seven original columns.
+output_file <- here::here(
+  "Outputs", "Tables", "Table6_Selected_Boundaries.docx"
+)
+dir.create(dirname(output_file), recursive = TRUE, showWarnings = FALSE)
+
+flextable::save_as_docx(
+  ft_table6, path = output_file,
+  pr_section = officer::prop_section(
+    page_size = officer::page_size(orient = "landscape")
+  )
+)
+
+ft_table6
+cat("Saved:", output_file, "\n")
+
+ft_table6
+```
+
+
+## 7. Performance of selected phosphorus boundaries — Figure S6
+
+This section treats each predicted phosphorus boundary as a **fixed concentration criterion**: a site is classified as Good when its
+observed P–PO4 concentration is at or below that boundary. These classifications are compared with observed `BinClass_HESY` (Good = 1, Not Good = 0).
+
+The four selected boundaries are retrieved **dynamically** from `selected_boundaries` (Section 6.7, Table 6). As in the manuscript, they are rounded to whole µg P/L. The underlying model-complete-case datasets are `dat_RM2` and `dat_RM4`; the same set of observations is used for every candidate boundary within each river type. 
+
+### 7.1 Classification statistics at the selected boundaries
+
+```{r selected_boundary_classification}
+# Classify sites as Good if their observed P-PO4 is <= the specified boundary.
+# This applies fixed P boundaries, not model-predicted probabilities.
+calc_boundary_stats <- function(data, boundary, river_type, criterion) {
+
+  if (length(boundary) != 1L || !is.finite(boundary) || boundary <= 0) {
+    stop("Expected one positive phosphorus boundary for ", river_type)
+  }
+
+  d <- data %>%
+    dplyr::transmute(
+      P_PO4 = 10^L10P_PO4,   # original units: ug P/L
+      ObservedGood = BinClass_HESY
+    ) %>%
+    dplyr::filter(is.finite(P_PO4), P_PO4 > 0, !is.na(ObservedGood))
+
+  if (nrow(d) == 0L || !all(d$ObservedGood %in% c(0, 1))) {
+    stop("Missing observations or invalid Good/Not Good classes for ", river_type)
+  }
+
+  predicted_good <- as.integer(d$P_PO4 <= boundary)
+  observed_good <- as.integer(d$ObservedGood)
+
+  TP <- sum(predicted_good == 1 & observed_good == 1)
+  TN <- sum(predicted_good == 0 & observed_good == 0)
+  FP <- sum(predicted_good == 1 & observed_good == 0)
+  FN <- sum(predicted_good == 0 & observed_good == 1)
+  N  <- TP + TN + FP + FN
+
+  commission <- if (FP + TN > 0) FP / (FP + TN) else NA_real_
+  omission   <- if (FN + TP > 0) FN / (FN + TP) else NA_real_
+
+  agreement_obs <- (TP + TN) / N
+  agreement_exp <- ((TP + FP) * (TP + FN) +
+                    (TN + FN) * (TN + FP)) / N^2
+  kappa <- if (agreement_exp < 1) {
+    (agreement_obs - agreement_exp) / (1 - agreement_exp)
+  } else {
+    NA_real_
+  }
+
+  tibble::tibble(
+    River_type = river_type,
+    Criterion = criterion,
+    Boundary = boundary,
+    N = N, TP = TP, TN = TN, FP = FP, FN = FN,
+    Commission = commission,
+    Omission = omission,
+    Kappa = kappa,
+    ObservedGood = (TP + FN) / N,
+    PredictedGood = (TP + FP) / N
+  )
+}
+
+# Use the already-computed Table 6 boundary scenarios: no fixed P values.
+boundary_datasets <- list("R-M2" = dat_RM2, "R-M4" = dat_RM4)
+
+boundary_performance <- purrr::pmap_dfr(
+  selected_boundaries,
+  function(River_type, Criterion, Boundary) {
+    calc_boundary_stats(
+      data = boundary_datasets[[River_type]],
+      boundary = Boundary,
+      river_type = River_type,
+      criterion = Criterion
+    )
+  }
+)
+
+print(boundary_performance)
+
+output_file <- here::here(
+  "Outputs", "Tables", "Selected_Boundary_Classification_Performance.csv"
+)
+dir.create(dirname(output_file), recursive = TRUE, showWarnings = FALSE)
+readr::write_csv(boundary_performance, output_file, na = "")
+cat("Saved:", output_file, "\n")
+```
+
+### 7.2 Figure S6 — Commission and omission versus phosphorus boundary
+
+The lines show how classification errors vary as the phosphorus concentration boundary changes, **separately for R-M2 and R-M4**. We evaluate boundaries at every distinct observed phosphorus concentration, plus the selected median and operational boundaries. Vertical dashed/dotted lines indicate the dynamically selected median/operational boundaries, and open points mark their corresponding error rates. A logarithmic phosphorus axis allows low and high concentrations to be shown without compressing the operational range.
+
+```{r Figure_S6, fig.width=8, fig.height=4.8, dpi=300}
+# Calculate classification error rates across the observed P range.
+# Always include the four selected boundaries in the candidate grid.
+boundary_performance_curve <- purrr::imap_dfr(
+  boundary_datasets,
+  function(data, river_type) {
+
+    observed_P <- 10^data$L10P_PO4
+    observed_P <- observed_P[is.finite(observed_P) & observed_P > 0]
+    if (!length(observed_P)) stop("No positive phosphorus data for ", river_type)
+
+    candidate_boundaries <- sort(unique(c(
+      min(observed_P) / 2,    # baseline below first observed value
+      observed_P,
+      selected_boundaries$Boundary[
+        selected_boundaries$River_type == river_type
+      ]
+    )))
+
+    purrr::map_dfr(candidate_boundaries, function(b) {
+      calc_boundary_stats(data, b, river_type, "Candidate")
+    })
+  }
+)
+
+# Long format for the two error curves.
+curve_long <- boundary_performance_curve %>%
+  tidyr::pivot_longer(
+    cols = c(Commission, Omission),
+    names_to = "Error", values_to = "Rate"
+  )
+
+# The four points at the manuscript median and operational boundaries.
+selected_points <- boundary_performance %>%
+  tidyr::pivot_longer(
+    cols = c(Commission, Omission),
+    names_to = "Error", values_to = "Rate"
+  )
+
+fig_S6 <- ggplot(curve_long, aes(x = Boundary, y = Rate, colour = Error)) +
+  geom_vline(
+    data = selected_boundaries,
+    aes(xintercept = Boundary, linetype = Criterion),
+    colour = "grey45", linewidth = 0.6
+  ) +
+  geom_step(linewidth = 0.85, direction = "hv") +
+  geom_point(
+    data = selected_points,
+    shape = 21, fill = "white", size = 2.3, stroke = 0.8
+  ) +
+  facet_wrap(
+  ~River_type,
+  nrow = 1,
+) +
+  scale_x_log10(
+  breaks = c(5, 10, 20, 50, 100, 200, 500),
+  minor_breaks = c(
+    6, 7, 8, 9,
+    30, 40,
+    60, 70, 80, 90,
+    300, 400
+  ),
+  guide = guide_axis(minor.ticks = TRUE)
+) +
+coord_cartesian(
+  xlim = c(5, 500),
+  expand = FALSE
+) +
+scale_y_continuous(
+  limits = c(0, 1),
+  breaks = seq(0, 1, by = 0.2),
+  minor_breaks = seq(0, 1, by = 0.1),
+  labels = scales::label_percent(accuracy = 1),
+  guide = guide_axis(minor.ticks = TRUE)
+) +
+  scale_colour_manual(
+    values = c("Commission" = "red", "Omission" = "orange")
+  ) +
+  scale_linetype_manual(
+    name = "Selected boundary",
+    values = c("Median" = "dashed", "Operational" = "dotted")
+  ) +
+  labs(
+    x = "P–PO4 boundary (µg P/L)",
+    y = "Classification error rate",
+    colour = "Error type"
+  ) +
+  theme_classic(base_size = 11) +
+  theme(
+  strip.text = element_text(face = "bold"),
+  # Increase space between facets
+  panel.spacing.x = grid::unit(0.8, "cm"),
+  legend.position = "bottom",
+    axis.minor.ticks.length.y = rel(0.5)
+)
+
+fig_S6
+
+output_file <- here::here(
+  "Outputs", "Figures", "Figure_S6_Boundary_Classification_Performance.png"
+)
+dir.create(dirname(output_file), recursive = TRUE, showWarnings = FALSE)
+
+ggplot2::ggsave(
+  filename = output_file,
+  plot = fig_S6,
+  width = 8, height = 4.8, units = "in", dpi = 300
+)
+cat("Saved:", output_file, "\n")
+```
+
+
+## 8. Sensitivity to probability-threshold selection — Table S3
+
+Boundary estimates depend on the probability cut-off used to define Good ecological status. This analysis recomputes phosphorus boundaries for the alternative cut-offs reported in Section 4, holding the remaining covariates at representative values: R-M2 optimal at conductivity 0.31 mS/cm and HMS = 9; R-M4 optimal at HMS = 7; R-M4 additional at HMS = 7 and DO = 10 mg/L. The phosphate-only models do not require additional covariate settings.
+
+### 8.1 Calculate scenario-dependent boundaries
+
+```{r threshold_sensitivity_boundaries}
+# Explicit univariate solution for p when L10P_PO4 is the only predictor.
+# Original P_PO4 units are restored by exponentiating base 10.
+boundary_uni <- function(model, p) {
+  b <- stats::coef(model)
+  10^((stats::qlogis(p) - b["(Intercept)"]) / b["L10P_PO4"])
+}
+
+threshold_boundaries <- threshold_results %>%
+  mutate(
+    Boundary = pmap_dbl(
+      list(Model, p),
+      function(Model, p) {
+
+        switch(
+          Model,
+
+          "R-M2 univariate" =
+            boundary_uni(mod_P_RM2, p),
+
+          "R-M2 optimal" =
+            solve_predictor_given_p(
+              mod_u_RM2,
+              p_target = p,
+              target_var = "L10P_PO4",
+              others = list(
+                HMS = 9,
+                L10Cond = log10(0.31)
+              ),
+              log10_vars = "L10P_PO4"
+            ),
+
+          "R-M4 univariate" =
+            boundary_uni(mod_P_RM4, p),
+
+          "R-M4 optimal" =
+            solve_predictor_given_p(
+              mod_u_RM4,
+              p_target = p,
+              target_var = "L10P_PO4",
+              others = list(HMS = 7),
+              log10_vars = "L10P_PO4"
+            ),
+
+          "R-M4 additional" =
+            solve_predictor_given_p(
+              mod_u2_RM4,
+              p_target = p,
+              target_var = "L10P_PO4",
+              others = list(
+                HMS = 7,
+                DO = 10
+              ),
+              log10_vars = "L10P_PO4"
+            )
+        )
+      }
+    )
+  )
+```
+
+### 8.2 Assemble and export Table S3
+
+```{r threshold_sensitivity_summary}
+sensitivity_table <- threshold_boundaries %>%
+  mutate(
+    across(
+      c(p, Commission, Omission, kappa),
+      ~ round(.x, 3)
+    ),
+  ) %>%
+  arrange(Model, Rule)
+
+```
+
+```{r threshold_sensitivity_table}
+# Prepare table for Word
+tab_word <- sensitivity_table %>%
+  select(Model, Rule, p, Commission, Omission, kappa, Boundary) %>%
+  mutate(
+    p = sprintf("%.2f", p),
+    Commission = sprintf("%.3f", Commission),
+    Omission = sprintf("%.3f", Omission),
+    kappa = sprintf("%.3f", kappa),
+    Boundary = sprintf("%.0f", Boundary)
+  ) %>%
+  rename(
+    `Probability` = p,
+    `Kappa` = kappa,
+    `P boundary (µg P/L)` = Boundary
+  )
+
+# Identify first row of each new model (excluding first model)
+model_rows <- which(
+  tab_word$Model != dplyr::lag(tab_word$Model)
+)
+model_rows <- setdiff(model_rows, 1)
+
+# Create formatted table
+ft <- flextable(tab_word) %>%
+  theme_booktabs() %>%
+  fontsize(size = 9, part = "all") %>%
+  bold(part = "header") %>%
+  align(j = 3:7, align = "right", part = "all") %>%
+  hline(
+    i = model_rows - 1,
+    border = officer::fp_border(
+      color = "#B0B0B0",
+      width = 0.5
+    ),
+    part = "body"
+  ) %>%
+  autofit()
+
+ft
+
+# Create Word document
+doc <- read_docx() %>%
+  body_add_par(
+    "Table S3. Sensitivity of classification performance and predicted phosphorus boundaries to alternative probability-threshold selection criteria.",
+    style = "Normal"
+  ) %>%
+  body_add_flextable(ft)
+
+# Ensure output directory exists
+dir.create(here::here("Outputs", "Tables"), recursive = TRUE, showWarnings = FALSE)
+
+# Save
+print(
+  doc,
+  target = here("Outputs", "Tables", "Table_S3_Threshold_sensitivity.docx")
+)
+```
+
+### 8.3 Bootstrap confidence intervals for univariate phosphorus boundaries
+
+Bootstrap confidence intervals were calculated for the phosphorus-only logistic regression models for R-M2 and R-M4 rivers. 
+For each model, 1,000 bootstrap datasets were generated by resampling the observations used to fit that model, with replacement. The model was refitted to each bootstrap sample, and the phosphorus boundary was recalculated using the probability thresholds identified in Section 4. 
+
+The 2.5th and 97.5th percentiles of the bootstrap boundary estimates provide 95% confidence intervals. These intervals describe sampling uncertainty conditional on the model structure and probability threshold; they do not incorporate uncertainty in threshold selection.
+
+```{r bootstrap_univariate_boundaries}
+
+# ------------------------------------------------------------
+# Bootstrap confidence intervals for univariate P boundaries
+# R-M2 and R-M4
+# ------------------------------------------------------------
+
+n_boot_uni <- 1000
+
+# ------------------------------------------------------------
+# 1. Function to calculate bootstrap confidence intervals
+# ------------------------------------------------------------
+
+bootstrap_uni <- function(model, p_values, n_boot = 1000) {
+
+  # Use exactly the observations used to fit the model
+  dat_boot <- model.frame(model)
+
+  # Unique probability thresholds
+  p_values <- unique(p_values)
+
+  stopifnot(all(is.finite(p_values) &
+                p_values > 0 & p_values < 1))
+
+  # Matrix for bootstrap boundary estimates
+  boot_mat <- matrix(
+    NA_real_,
+    nrow = length(p_values),
+    ncol = n_boot
+  )
+
+  set.seed(123)
+
+  for (i in seq_len(n_boot)) {
+
+    # Resample observations with replacement
+    boot_dat <- dat_boot[
+      sample.int(nrow(dat_boot), replace = TRUE),
+      ,
+      drop = FALSE
+    ]
+
+    # Refit univariate model
+    boot_mod <- tryCatch(
+      suppressWarnings(
+        glm(
+          formula(model),
+          data = boot_dat,
+          family = binomial(link = "logit")
+        )
+      ),
+      error = function(e) NULL
+    )
+
+    # Calculate phosphorus boundaries
+    if (!is.null(boot_mod) &&
+        isTRUE(boot_mod$converged)) {
+
+      b <- coef(boot_mod)
+
+      if (all(is.finite(b)) &&
+          abs(b["L10P_PO4"]) > 1e-8) {
+
+        boot_mat[, i] <- as.numeric(
+          boundary_uni(boot_mod, p_values)
+        )
+      }
+    }
+  }
+
+  # ----------------------------------------------------------
+  # Calculate percentile confidence intervals
+  # ----------------------------------------------------------
+
+  CI <- t(
+    apply(boot_mat, 1, function(x) {
+
+      x <- x[is.finite(x) & x > 0]
+
+      if (length(x) < 2) {
+        return(c(
+          Lower95 = NA_real_,
+          Upper95 = NA_real_,
+          N_boot = length(x)
+        ))
+      }
+
+      c(
+        Lower95 = unname(quantile(x, 0.025)),
+        Upper95 = unname(quantile(x, 0.975)),
+        N_boot = length(x)
+      )
+    })
+  )
+
+  tibble(
+    p = p_values,
+    Lower95 = CI[, "Lower95"],
+    Upper95 = CI[, "Upper95"],
+    N_boot = as.integer(CI[, "N_boot"])
+  )
+}
+
+
+# ------------------------------------------------------------
+# 2. Identify univariate models and probability thresholds
+# ------------------------------------------------------------
+
+uni_targets <- threshold_boundaries %>%
+  filter(
+    Model %in% c(
+      "R-M2 univariate",
+      "R-M4 univariate"
+    )
+  ) %>%
+  select(Model, Rule, p, Boundary)
+
+
+# ------------------------------------------------------------
+# 3. Bootstrap R-M2
+# ------------------------------------------------------------
+
+CI_RM2_uni <- bootstrap_uni(
+  model = mod_P_RM2,
+  p_values = uni_targets %>%
+    filter(Model == "R-M2 univariate") %>%
+    pull(p),
+  n_boot = n_boot_uni
+) %>%
+  mutate(Model = "R-M2 univariate")
+
+
+# ------------------------------------------------------------
+# 4. Bootstrap R-M4
+# ------------------------------------------------------------
+
+CI_RM4_uni <- bootstrap_uni(
+  model = mod_P_RM4,
+  p_values = uni_targets %>%
+    filter(Model == "R-M4 univariate") %>%
+    pull(p),
+  n_boot = n_boot_uni
+) %>%
+  mutate(Model = "R-M4 univariate")
+
+
+# ------------------------------------------------------------
+# 5. Combine original estimates and bootstrap intervals
+# ------------------------------------------------------------
+
+results_boot_uni <- uni_targets %>%
+  left_join(
+    bind_rows(CI_RM2_uni, CI_RM4_uni),
+    by = c("Model", "p")
+  ) %>%
+  arrange(Model, Rule)
+
+
+# ------------------------------------------------------------
+# 6. Display results
+# ------------------------------------------------------------
+
+results_boot_uni %>%
+  mutate(
+    Boundary_CI = sprintf(
+      "%.0f (%.0f–%.0f)",
+      Boundary, Lower95, Upper95
+    )
+  ) %>%
+  select(
+    Model, Rule, p, Boundary_CI, N_boot
+  ) %>%
+  knitr::kable(
+    digits = 2,
+    col.names = c(
+      "Model",
+      "Threshold rule",
+      "Probability",
+      "P boundary (95% CI)",
+      "Valid bootstrap estimates"
+    ),
+    caption = paste(
+      "Univariate phosphorus boundaries (µg P/L)",
+      "and bootstrap 95% confidence intervals."
+    )
+  )
+
+
+# ------------------------------------------------------------
+# 7. Export results
+# ------------------------------------------------------------
+
+output_file <- here::here(
+  "Outputs", "Tables",
+  "Univariate_Boundary_Bootstrap_CI.csv"
+)
+
+dir.create(
+  dirname(output_file),
+  recursive = TRUE,
+  showWarnings = FALSE
+)
+
+readr::write_csv(
+  results_boot_uni,
+  output_file
+)
+
+cat("Saved:", output_file, "\n")
+
+```
+
+## 9. How boundary uncertainty varies across environmental gradients — Figure S5
+
+Figure S5 examines the relative size of the percentile bootstrap intervals at different combinations of the model covariates. For each combination, relative interval width is defined as
+
+$$
+\text{Relative 95\% CI width} =
+\frac{\text{Upper 95\% limit} - \text{Lower 95\% limit}}
+     {\text{Boundary from the fitted model}}.
+$$
+
+For the R-M2 optimal and R-M4 additional models, log10 relative width is mapped in filled contours for visualisation, with legend labels transformed back to the original relative-width scale. For the R-M4 optimal model, relative width is shown directly against HMS. Observed interquartile ranges are marked by dashed lines and the selected scenario is marked in red.
+
+### 9.1 Extend R-M4 HMS predictions for the uncertainty plot
+
+Because the log10 boundary is linear in HMS for these additive logistic models, the HMS-specific boundary from each saved bootstrap replicate can be extended to HMS = 0–50 from its predictions at HMS = 2 and 15. Percentile limits are then recalculated from those replicate-wise extrapolated boundaries. This preserves the original bootstrap variation without rerunning the model fits. The extrapolation is algebraically exact for a given additive fitted model, but ecological interpretation becomes less secure outside the range well represented by observations.
+
+```{r RM4_extended_predictions_S5}
+
+# ------------------------------------------------------------
+# Extended HMS predictions for Figure S5 only
+# No additional model fitting or bootstrap resampling required
+# ------------------------------------------------------------
+
+HMS_vals_S5 <- sort(unique(c(
+  seq(0, 50, by = 2),
+  7, 15
+)))
+
+# Calculate boundaries at new HMS values using the
+# bootstrap predictions at HMS = 2 and HMS = 15
+
+extend_boot_RM4 <- function(grid_new, grid_old, boot_matrix,
+                            model, p_target) {
+
+  CI <- t(sapply(seq_len(nrow(grid_new)), function(i) {
+
+    h <- grid_new$HMS[i]
+
+    # Select the appropriate original bootstrap rows
+    idx2  <- grid_old$HMS == 2
+    idx15 <- grid_old$HMS == 15
+
+    if ("DO" %in% names(grid_new)) {
+      idx2  <- idx2  & grid_old$DO == grid_new$DO[i]
+      idx15 <- idx15 & grid_old$DO == grid_new$DO[i]
+    }
+
+    j2  <- which(idx2)
+    j15 <- which(idx15)
+
+    stopifnot(length(j2) == 1, length(j15) == 1)
+
+    b2  <- boot_matrix[j2, ]
+    b15 <- boot_matrix[j15, ]
+
+    # Extrapolate log10 phosphorus boundary for each replicate
+    valid <- is.finite(b2) & b2 > 0 &
+             is.finite(b15) & b15 > 0
+
+    predictions <- rep(NA_real_, length(b2))
+
+    predictions[valid] <- 10^(
+      log10(b2[valid]) +
+      (h - 2) / (15 - 2) *
+      (log10(b15[valid]) - log10(b2[valid]))
+    )
+
+    predictions <- predictions[is.finite(predictions)]
+
+    if (length(predictions) < 2) {
+      return(c(NA_real_, NA_real_))
+    }
+
+    as.numeric(quantile(
+      predictions,
+      probs = c(0.025, 0.975)
+    ))
+  }))
+
+  # Original fitted-model predictions
+  grid_new %>%
+    mutate(
+      Boundary = calc_boundary_RM4(
+        model, grid_new, p_target
+      ),
+      Lower95 = CI[, 1],
+      Upper95 = CI[, 2]
+    )
+}
+
+
+# ------------------------------------------------------------
+# R-M4 optimal model: HMS = 0 to 50
+# ------------------------------------------------------------
+
+grid_opt_S5 <- tibble(
+  HMS = HMS_vals_S5
+)
+
+results_boot_RM4_opt_S5 <- extend_boot_RM4(
+  grid_new = grid_opt_S5,
+  grid_old = grid_opt_RM4,
+  boot_matrix = boot_opt_RM4,
+  model = mod_u_RM4,
+  p_target = p_opt_RM4
+)
+
+
+# ------------------------------------------------------------
+# R-M4 additional model: DO and HMS = 0 to 50
+# ------------------------------------------------------------
+
+grid_add_S5 <- tidyr::expand_grid(
+  DO = DO_vals_RM4_table,
+  HMS = HMS_vals_S5
+)
+
+results_boot_RM4_add_S5 <- extend_boot_RM4(
+  grid_new = grid_add_S5,
+  grid_old = grid_add_RM4,
+  boot_matrix = boot_add_RM4,
+  model = mod_u2_RM4,
+  p_target = p_add_RM4
+)
+
+
+
+
+```
+
+### 9.2 Figure S5 — three-panel uncertainty display
+
+Panels (a) and (b) use a common set of contour intervals and a shared vertical legend; panel (c) shows the R-M4 optimal model. The exported figure is sized for an A4 portrait page.
+
+```{r Figure_S5, fig.width=6.6, fig.height=9.2}
+
+# ------------------------------------------------------------
+# 1. Prepare data
+# ------------------------------------------------------------
+
+plot_dat_RM2 <- results_boot_RM2 %>%
+  mutate(
+    Relative_width = (Upper95 - Lower95) / Boundary,
+    Log_relative_width = log10(Relative_width)
+  )
+
+plot_dat_RM4_add <- results_boot_RM4_add_S5 %>%
+  mutate(
+    Relative_width = (Upper95 - Lower95) / Boundary,
+    Log_relative_width = log10(Relative_width)
+  )
+
+plot_dat_RM4_opt <- results_boot_RM4_opt_S5 %>%
+  mutate(
+    Relative_width = (Upper95 - Lower95) / Boundary
+  )
+
+
+# ------------------------------------------------------------
+# 2. Observed interquartile ranges
+# ------------------------------------------------------------
+
+Cond_IQR_RM2 <- quantile(
+  10^dat_RM2$L10Cond,
+  c(0.25, 0.75),
+  na.rm = TRUE
+)
+
+HMS_IQR_RM2 <- quantile(
+  dat_RM2$HMS,
+  c(0.25, 0.75),
+  na.rm = TRUE
+)
+
+HMS_IQR_RM4 <- quantile(
+  dat_RM4_boot$HMS,
+  c(0.25, 0.75),
+  na.rm = TRUE
+)
+
+DO_IQR_RM4 <- quantile(
+  dat_RM4_boot$DO,
+  c(0.25, 0.75),
+  na.rm = TRUE
+)
+
+
+# ------------------------------------------------------------
+# 3. Common contour scale
+# ------------------------------------------------------------
+
+z_range <- range(
+  c(
+    plot_dat_RM2$Log_relative_width,
+    plot_dat_RM4_add$Log_relative_width
+  ),
+  finite = TRUE
+)
+
+# Approximately six contour classes
+contour_breaks <- pretty(z_range, n = 6)
+
+# Convert log10 interval labels back to relative width
+format_CI_width <- function(x) {
+
+  sapply(x, function(label) {
+
+    nums <- regmatches(
+      label,
+      gregexpr("-?[0-9]+\\.?[0-9]*", label)
+    )[[1]]
+
+    if (length(nums) == 2) {
+
+      paste0(
+        sprintf("%.1f", 10^as.numeric(nums[1])),
+        "–",
+        sprintf("%.1f", 10^as.numeric(nums[2]))
+      )
+
+    } else {
+      label
+    }
+  })
+}
+
+# Common colour scale with VERTICAL legend
+CI_fill_scale <- function() {
+
+  scale_fill_viridis_d(
+    name = "Relative 95%\nCI width",
+    labels = format_CI_width,
+    drop = FALSE,
+    guide = guide_legend(
+      ncol = 1,
+      keyheight = grid::unit(0.35, "cm"),
+      keywidth = grid::unit(0.45, "cm")
+    )
+  )
+}
+
+
+# ------------------------------------------------------------
+# 4. Panel (a): R-M2 optimal
+# ------------------------------------------------------------
+
+p_S5a <- ggplot(
+  plot_dat_RM2,
+  aes(
+    x = Cond,
+    y = HMS,
+    z = Log_relative_width
+  )
+) +
+
+  geom_contour_filled(
+    breaks = contour_breaks,
+    show.legend = TRUE
+  ) +
+
+  geom_vline(
+    xintercept = Cond_IQR_RM2,
+    linetype = "dashed",
+    linewidth = 0.5
+  ) +
+
+  geom_hline(
+    yintercept = HMS_IQR_RM2,
+    linetype = "dashed",
+    linewidth = 0.5
+  ) +
+
+  annotate(
+    "point",
+    x = 0.31,
+    y = 9,
+    colour = "red",
+    size = 2.5
+  ) +
+
+  CI_fill_scale() +
+
+  scale_x_continuous(
+    breaks = c(0.25, 0.40, 0.55, 0.70)
+  ) +
+
+  labs(
+    title = "a) Lowland rivers (R-M2): optimal model",
+    x = expression("Conductivity (mS cm"^{-1} * ")"),
+    y = "HMS"
+  ) +
+
+  theme_bw(base_size = 10) 
+
+
+# ------------------------------------------------------------
+# 5. Panel (b): R-M4 additional
+# ------------------------------------------------------------
+
+p_S5b <- ggplot(
+  plot_dat_RM4_add,
+  aes(
+    x = DO,
+    y = HMS,
+    z = Log_relative_width
+  )
+) +
+
+  geom_contour_filled(
+    breaks = contour_breaks,
+    show.legend = TRUE
+  ) +
+
+  geom_vline(
+    xintercept = DO_IQR_RM4,
+    linetype = "dashed",
+    linewidth = 0.5
+  ) +
+
+  geom_hline(
+    yintercept = HMS_IQR_RM4,
+    linetype = "dashed",
+    linewidth = 0.5
+  ) +
+
+  annotate(
+    "point",
+    x = 9.7,
+    y = 7,
+    colour = "red",
+    size = 2.5
+  ) +
+
+  CI_fill_scale() +
+
+  scale_x_continuous(
+    breaks = c(8, 9, 10, 10.5)
+  ) +
+
+  scale_y_continuous(
+    breaks = seq(0, 50, 10)
+  ) +
+
+  coord_cartesian(
+    ylim = c(0, 50)
+  ) +
+
+  labs(
+    title = "b) Upland rivers (R-M4): additional model",
+    x = expression("DO (mg L"^{-1} * ")"),
+    y = "HMS"
+  ) +
+
+  theme_bw(base_size = 10)
+
+
+# ------------------------------------------------------------
+# 6. Panel (c): R-M4 optimal
+# ------------------------------------------------------------
+
+p_S5c <- ggplot(
+  plot_dat_RM4_opt,
+  aes(
+    x = HMS,
+    y = Relative_width
+  )
+) +
+
+  geom_line(
+    linewidth = 0.8
+  ) +
+
+  geom_point(
+    size = 1.5
+  ) +
+
+  # Selected HMS
+  geom_vline(
+    xintercept = 7,
+    colour = "red",
+    linewidth = 0.6
+  ) +
+
+  # Observed IQR
+  geom_vline(
+    xintercept = HMS_IQR_RM4,
+    linetype = "dashed",
+    linewidth = 0.5
+  ) +
+
+  scale_x_continuous(
+    breaks = seq(0, 50, 10)
+  ) +
+
+  coord_cartesian(
+    xlim = c(0, 50)
+  ) +
+
+  labs(
+    title = "c) Upland rivers (R-M4): optimal model",
+    x = "HMS",
+    y = "Relative 95% CI width"
+  ) +
+
+  theme_bw(base_size = 10)
+
+
+# ------------------------------------------------------------
+# 7. Combine panels
+# ------------------------------------------------------------
+
+fig_S5 <- (
+  p_S5a /
+  p_S5b /
+  p_S5c
+) +
+
+  plot_layout(
+    heights = c(1, 1, 0.75),
+    guides = "collect"
+  ) &
+
+  theme(
+    legend.position = "right",
+    legend.direction = "vertical",
+
+    legend.title = element_text(size = 9),
+    legend.text = element_text(size = 8),
+
+    plot.title = element_text(
+      size = 10,
+      face = "bold"
+    ),
+
+    axis.title = element_text(size = 10),
+    axis.text = element_text(size = 9),
+
+    plot.margin = margin(4, 5, 4, 5),
+    # Increase space between facets
+    panel.spacing.x = grid::unit(0.8, "cm"),
+    # Minor ticks on x-axis
+  axis.minor.ticks.x.bottom = element_line(colour = "black"),
+  axis.minor.ticks.length.x.bottom = grid::unit(1.5, "mm")
+  )
+
+
+# ------------------------------------------------------------
+# 8. Display
+# ------------------------------------------------------------
+
+fig_S5
+
+
+# ------------------------------------------------------------
+# 9. Export
+# ------------------------------------------------------------
+
+output_file <- here::here(
+  "Outputs", "Figures", "Figure_S5.png"
+)
+
+dir.create(
+  dirname(output_file),
+  recursive = TRUE,
+  showWarnings = FALSE
+)
+
+ggsave(
+  filename = output_file,
+  plot = fig_S5,
+  width = 6.6,
+  height = 9.2,
+  units = "in",
+  dpi = 300
+)
+
+```
+
+## 10. Conductivity and agricultural land use — Figure 7
+
+To explore the interpretation of conductivity as a potential indicator of agricultural pressure, Figure 7 relates conductivity to the **sum of intensive and extensive agricultural land-use percentages** at R-M2 sites. A GAM smoother is used for visual description, with vertical lines at the 25th and 75th conductivity percentiles.
+
+```{r RM2_Conductivity_Agriculture, fig.width=7, fig.height=5}
+
+# ------------------------------------------------------------
+# 1. Prepare data
+# ------------------------------------------------------------
+
+# Confirm agricultural variables are available in the full site-mean input
+stopifnot(
+  all(c("intens_agric%", "extens_agric%") %in% names(dat))
+)
+
+# Prepare agricultural land-use data using all available R-M2 sites
+
+df_agric_RM2 <- dat %>%
+  filter(ICType == "R-M2") %>%
+  transmute(
+    Cond = 10^L10Cond,
+    agric = `intens_agric%` + `extens_agric%`
+  ) %>%
+  filter(
+    is.finite(Cond),
+    Cond > 0,
+    is.finite(agric)
+  )
+
+# Conductivity percentiles
+Cond_IQR <- quantile(
+  df_agric_RM2$Cond,
+  probs = c(0.25, 0.75),
+  na.rm = TRUE
+)
+
+cat("Number of observations:", nrow(df_agric_RM2), "\n")
+print(Cond_IQR)
+
+# ------------------------------------------------------------
+# 2. Create plot
+# ------------------------------------------------------------
+
+fig_agric_RM2 <- ggplot(
+  df_agric_RM2,
+  aes(x = Cond, y = agric)
+) +
+
+  geom_point(alpha = 0.5) +
+
+  geom_smooth(
+    method = "gam",
+    formula = y ~ s(x, k = 5),
+    colour = "blue",
+    se = TRUE
+  ) +
+
+  # 25th percentile conductivity
+  geom_vline(
+    xintercept = Cond_IQR[1],
+    colour = "red",
+    linetype = "dashed",
+    linewidth = 0.8
+  ) +
+
+  # 75th percentile conductivity
+  geom_vline(
+    xintercept = Cond_IQR[2],
+    colour = "black",
+    linetype = "dashed",
+    linewidth = 0.8
+  ) +
+
+  scale_x_log10() +
+
+  labs(
+    x = expression("Conductivity (mS cm"^{-1} * ")"),
+    y = "% agricultural land"
+  ) +
+
+  theme_bw(base_size = 12)
+
+
+# ------------------------------------------------------------
+# 3. Display figure
+# ------------------------------------------------------------
+
+fig_agric_RM2
+
+
+# ------------------------------------------------------------
+# 4. Save figure
+# ------------------------------------------------------------
+
+output_file <- here::here(
+  "Outputs", "Figures",
+  "Fig7_RM2_Conductivity_Agriculture.png"
+)
+
+dir.create(
+  dirname(output_file),
+  recursive = TRUE,
+  showWarnings = FALSE
+)
+
+ggsave(
+  filename = output_file,
+  plot = fig_agric_RM2,
+  width = 7,
+  height = 5,
+  dpi = 300,
+  units = "in"
+)
+
+```
+
+## 11 Input and output
+
+### 11.1 Input
+
+- **Section 1.1 — Model data:** `Data/Processed/Greek_RM2_RM4_SiteMeans.csv`
+- **Section 1.2 — Custom R functions:** `Functions/` — functions for model evaluation, probability threshold selection and phosphorus boundary prediction.
+
+### 11.2 Output — Manuscript tables
+
+- **Section 2.1 — Table 2, model coefficients:** `Outputs/Tables/Table2.docx`
+- **Section 2.3 — Table 3, spatial cross-validation:** `Outputs/Tables/Table3_Model_spatial_validation.docx`
+- **Section 5.3 — Table 4, R-M2 phosphorus boundaries and 95% confidence intervals:** `Outputs/Tables/Table4_RM2_Boundaries_CI.docx`
+- **Section 6.5 — Table 5, R-M4 phosphorus boundaries and 95% confidence intervals:** `Outputs/Tables/Table5_RM4_Boundaries_CI.docx`
+- **Section 6.7 — Table 6, selected median and operational boundaries:** `Outputs/Tables/Table6_Selected_Boundaries.docx`
+
+### 11.3 Output — Manuscript figures
+
+- **Section 3.1 — Figure 4, R-M2 predicted probabilities:** `Outputs/Figures/Figure_4_RM2_Predicted_Probabilities.png`
+- **Section 3.2 — Figure 5, R-M4 predicted probabilities:** `Outputs/Figures/Fig5_RM4_Predicted_Probabilities.png`
+- **Section 4.1 — Figure 6, probability threshold selection:** `Outputs/Figures/Figure_6.png`
+- **Section 10 — Figure 7, conductivity and agricultural land use:** `Outputs/Figures/Fig7_RM2_Conductivity_Agriculture.png`
+
+### 11.4 Output — Supplementary material
+
+- **Section 5.4 — Figure S3, R-M2 conditional phosphorus boundaries:** `Outputs/Figures/Figure_S3.png`
+- **Section 6.6 — Figure S4, R-M4 conditional phosphorus boundaries:** `Outputs/Figures/Figure_S4_RM4.png`
+- **Section 9.2 — Figure S5, variation in boundary uncertainty:** `Outputs/Figures/Figure_S5.png`
+- **Section 7.2 — Figure S6, fixed phosphorus boundary classification performance:** `Outputs/Figures/Figure_S6_Boundary_Classification_Performance.png`
+- **Section 8.2 — Table S3, sensitivity to probability threshold selection:** `Outputs/Tables/Table_S3_Threshold_sensitivity.docx`
+
+### 11.5 Output — Additional numerical results
+
+- **Section 7.1 — Median and operational boundary classification statistics:** `Outputs/Tables/Selected_Boundary_Classification_Performance.csv`
+- **Section 8.3 — Univariate phosphorus boundaries and bootstrap 95% confidence intervals:** `Outputs/Tables/Univariate_Boundary_Bootstrap_CI.csv`
+
+All files are written to the project-relative `Outputs` directory. Tables and figures are generated automatically when the corresponding sections of the notebook are executed.
+
+## 12. Reproducibility information
+
+The following information records the R environment and package versions used to execute this notebook. Package versions are reported for all packages declared in the setup section, including those accessed using `package::function()` rather than attached using `library()`.
+
+
+```{r, echo=FALSE, results='asis'}
+# ---- Reproducibility information ----
+
+cat("**Notebook executed:** ",
+    format(Sys.Date(), "%d %B %Y"), "\n\n")
+
+cat("**R version:** ",
+    R.version.string, "\n\n")
+
+cat("**Platform:** ",
+    R.version$platform, "\n\n")
+
+cat("**Package versions:**\n\n")
+
+for (pkg in required_packages) {
+  cat(
+    "- ", pkg, ": ",
+    as.character(utils::packageVersion(pkg)),
+    "\n",
+    sep = ""
+  )
+}
+```
+

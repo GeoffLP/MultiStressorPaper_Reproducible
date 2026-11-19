@@ -1,0 +1,319 @@
+---
+title: "Greek rivers: logistic model selection"
+subtitle: "Step 4 - model selection and coefficient tables"
+output:
+  html_notebook:
+    toc: true
+    code_folding: show
+---
+
+## Purpose
+
+This notebook compares binary logistic regression models for Greek river types R-M2 and R-M4 using the Akaike Information Criterion corrected for small sample size 
+(AICc), to identify the most appropriate models for subsequent prediction of boundary criteria.
+
+Models are fitted separately for the two river types using the prepared site-averaged dataset supplied in `Data/Processed/`. The preparation of this dataset is described in the repository README. All subsets of five candidate predictors are evaluated, and coefficient estimates for the retained models are reported in Table S2.
+
+The selected models will subsequently be refitted using datasets containing only their respective predictor variables. Spatially blocked cross-validation, predictive performance and uncertainty analyses will be documented in subsequent notebooks. 
+
+```{r setup, echo=TRUE, message=FALSE, warning=FALSE}
+# ---- Required packages ----
+# dplyr     : Data manipulation and filtering
+# readr     : Reading CSV data
+# here      : Project-relative file paths
+# MuMIn     : All-subsets model selection using AICc
+# flextable : Formatting and exporting model comparison tables
+# officer   : Word document page layout and formatting
+
+required_packages <- c(
+  "dplyr",
+  "readr",
+  "here",
+  "MuMIn",
+  "flextable",
+  "officer"
+)
+
+# Check that all required packages are installed
+missing_packages <- required_packages[
+  !vapply(required_packages, requireNamespace,
+          logical(1), quietly = TRUE)
+]
+
+if (length(missing_packages) > 0) {
+  stop(
+    "Missing required packages: ",
+    paste(missing_packages, collapse = ", "),
+    "\nInstall these packages before running this notebook."
+  )
+}
+
+# ---- Load packages used without :: ----
+
+library(dplyr)
+library(flextable)
+
+# Other packages are accessed using package::function()
+```
+
+
+## 1. Load modelling data
+
+The five environmental predictors are phosphate, nitrate, conductivity,
+dissolved oxygen and Habitat Modification Score. Phosphate, nitrate and
+conductivity were log10-transformed **after averaging** in the preceding
+notebook. The binary response is 1 for mean HESY2 EQR >= good moderate boundary and 0 otherwise.
+
+```{r}
+
+input_file <- here::here("Data", "Processed", "Greek_RM2_RM4_SiteMeans.csv")
+stopifnot(file.exists(input_file))
+
+predictors <- c("L10P_PO4", "L10N_NO3", "L10Cond", "DO", "HMS")
+model_vars <- c("BinClass_HESY", predictors)
+required_vars <- c("ICType", "HESY2", model_vars)
+
+dat <- readr::read_csv(input_file, show_col_types = FALSE)
+missing_vars <- setdiff(required_vars, names(dat))
+if (length(missing_vars)) {
+  stop("Missing required columns: ", paste(missing_vars, collapse = ", "))
+}
+
+# Use the same complete-case subset for every candidate model within a type.
+# Keep site and Water District identifiers for later spatial validation.
+make_model_data <- function(x, river_type) {
+  x %>%
+    filter(ICType == river_type, !is.na(HESY2)) %>%
+    filter(if_all(all_of(model_vars), is.finite)) %>%
+    as.data.frame()
+}
+
+dat_RM2 <- make_model_data(dat, "R-M2")
+dat_RM4 <- make_model_data(dat, "R-M4")
+
+# Confirm the binary response and presence of both outcome classes.
+for (x in list(dat_RM2, dat_RM4)) {
+  stopifnot(all(x$BinClass_HESY %in% c(0, 1)))
+  stopifnot(length(unique(x$BinClass_HESY)) == 2L)
+}
+
+```
+
+
+
+### Complete-case dataset summary
+
+```{r dataset-summary}
+
+print(exists("dat_RM2"))
+print(exists("dat_RM4"))
+
+sample_summary <- dplyr::bind_rows(
+  dat_RM2 %>% mutate(ICType = "R-M2"),
+  dat_RM4 %>% mutate(ICType = "R-M4")
+) %>%
+  group_by(ICType) %>%
+  summarise(
+    N = n(),
+    Good = sum(BinClass_HESY == 1),
+    Not_Good = sum(BinClass_HESY == 0),
+    Prevalence = mean(BinClass_HESY == 1),
+    .groups = "drop"
+  )
+
+print(sample_summary)
+```
+
+## 2. Fit global models and perform all-subsets selection
+
+The global logistic model includes all five candidate predictors without
+interaction terms. The `MuMIn::dredge()` procedure ranks all subsets by AICc.
+Only observations complete for the entire global model enter the comparison,
+ensuring that AICc is calculated for models fitted to the same data.
+
+The `na.action = na.fail` argument is supplied directly to `glm()`, so there
+is no need to change the R session's global `na.action` option.
+
+```{r dredge}
+full_formula <- BinClass_HESY ~ L10P_PO4 + L10N_NO3 + L10Cond + DO + HMS
+
+mod_full_RM2 <- glm(
+  full_formula, data = dat_RM2,
+  family = binomial(link = "logit"), na.action = na.fail
+)
+mod_full_RM4 <- glm(
+  full_formula, data = dat_RM4,
+  family = binomial(link = "logit"), na.action = na.fail
+)
+
+dredge_RM2 <- MuMIn::dredge(mod_full_RM2, rank = "AICc", trace = FALSE)
+dredge_RM4 <- MuMIn::dredge(mod_full_RM4, rank = "AICc", trace = FALSE)
+
+# R-M2
+cat("\n--- Dredge Results for R-M2 ---\n")
+print(
+  subset(
+    dredge_RM2,
+    delta <= 2 |
+      has(L10P_PO4, !L10N_NO3, !L10Cond, !DO, !HMS),
+    recalc.weights = FALSE
+  )
+)
+
+# R-M4
+cat("\n--- Dredge Results for R-M4 ---\n")
+print(
+  subset(
+    dredge_RM4,
+    delta <= 2 |
+      has(L10P_PO4, !L10N_NO3, !L10Cond, !DO, !HMS),
+    recalc.weights = FALSE
+  )
+)
+```
+
+```{r table-S2-data}
+# Extract competitive models and the phosphorus-only model
+prepare_dredge_table <- function(dredge_result, river_type) {
+
+  selected <- subset(
+    dredge_result,
+    delta <= 2 |
+      has(L10P_PO4, !L10N_NO3, !L10Cond, !DO, !HMS),
+    recalc.weights = FALSE
+  )
+
+  tab <- as.data.frame(selected)
+
+  # Retain model numbers from the dredge output
+  tab$Model <- rownames(tab)
+  tab$River_Type <- river_type
+
+  # Select and order columns
+  tab <- tab %>%
+    dplyr::select(
+      River_Type, Model, `(Intercept)`,
+      DO, HMS, L10Cond, L10N_NO3, L10P_PO4,
+      df, logLik, AICc, delta, weight
+    )
+
+  return(tab)
+}
+
+# Combine both river types
+table_S2 <- dplyr::bind_rows(
+  prepare_dredge_table(dredge_RM2, "R-M2"),
+  prepare_dredge_table(dredge_RM4, "R-M4")
+)
+
+table_S2
+
+```
+
+This preserves the original model numbering, coefficients, AICc, ΔAICc and weights.
+
+### Format and export using flextable
+
+```{r}
+# Identify numeric columns
+stat_cols <- c(
+  "(Intercept)", "DO", "HMS", "L10Cond",
+  "L10N_NO3", "L10P_PO4",
+  "logLik", "AICc", "delta", "weight"
+)
+
+ft_S2 <- flextable(table_S2) %>%
+
+  # Column headings
+  set_header_labels(
+    River_Type = "River type",
+    Model = "Model",
+    `(Intercept)` = "Intercept",
+    df = "df",
+    logLik = "logLik",
+    AICc = "AICc",
+    delta = "Delta",
+    weight = "Weight"
+  ) %>%
+
+  # Number formatting
+  colformat_double(
+    j = stat_cols,
+    digits = 3,
+    na_str = ""
+  ) %>%
+
+  colformat_int(j = "df") %>%
+
+  # Table appearance
+  theme_booktabs() %>%
+  bold(part = "header") %>%
+  merge_v(j = "River_Type") %>%
+  valign(j = "River_Type", valign = "top") %>%
+  align(j = stat_cols, align = "right", part = "body") %>%
+  fontsize(size = 8, part = "all") %>%
+  autofit()
+
+# Display table in notebook
+ft_S2
+
+# Save as Word document
+output_file <- here::here(
+  "Outputs", "Tables", "Table_S2.docx"
+)
+
+dir.create(
+  dirname(output_file),
+  recursive = TRUE,
+  showWarnings = FALSE
+)
+
+section <- officer::prop_section(
+  page_size = officer::page_size(
+    orient = "landscape",
+    width = 8.27,
+    height = 11.69
+  )
+)
+
+flextable::save_as_docx(
+  "Table S2. AICc comparison of candidate logistic models" = ft_S2,
+  path = output_file,
+  pr_section = section
+)
+
+cat("Saved:", output_file, "\n")
+```
+
+
+
+
+## 3. Models retained for subsequent evaluation
+
+The model formulas below reproduce the set considered in the paper.
+
+- R-M2: univariate phosphate model 17 and the optimal multivariate HMS + conductivity + phosphate model 23.
+- R-M4: univariate phosphate model 17, the optimal HMS + phosphate model 19 and
+        additional HMS + DO + phosphate model 20.
+
+They are re-fitted in notebook `04_Model_Evaluation.Rmd`
+
+
+
+
+## Input and output
+
+- **Input:** `Data/Processed/Greek_RM2_RM4_SiteMeans.csv`
+- **Table S2:** `Outputs/Tables/Table_S2.docx`
+
+## Reproducibility information
+
+```{r reproducibility, echo=FALSE, results='asis'}
+cat("**Notebook executed:**  ", format(Sys.Date(), "%d %B %Y"), "\n\n")
+cat("**R version:**  ", R.version.string, "\n\n")
+cat("**Platform:**  ", R.version$platform, "\n\n")
+cat("**Package versions:**\n\n")
+for (pkg in required_packages) {
+  cat("- ", pkg, ": ", as.character(utils::packageVersion(pkg)), "\n", sep = "")
+}
+```
